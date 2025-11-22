@@ -1,7 +1,7 @@
 use coreaudio_sys::*;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
 // Define the Host Interface struct locally since coreaudio-sys seems to treat it as opaque or we are having trouble dereferencing it.
 // This layout must match the C definition of AudioServerPlugInHostInterface.
@@ -22,6 +22,9 @@ pub struct PrismDriver {
     pub host_ticks_per_frame: f64,
     pub client_count: AtomicU32,
     pub phase: f64,
+    pub loopback_buffer: Vec<f32>,
+    pub write_pos: AtomicUsize,
+    pub read_pos: AtomicUsize,
 }
 
 // The singleton instance of our driver
@@ -696,6 +699,8 @@ unsafe extern "C" fn start_io(
         let now = libc::mach_absolute_time();
         (*driver).anchor_host_time.store(now, Ordering::SeqCst);
         (*driver).num_time_stamps.store(0, Ordering::SeqCst);
+        (*driver).write_pos.store(0, Ordering::SeqCst);
+        (*driver).read_pos.store(0, Ordering::SeqCst);
 
         if let Some(host) = (*driver).host {
              let address = AudioObjectPropertyAddress {
@@ -814,25 +819,39 @@ unsafe extern "C" fn do_io_operation(
     _io_secondary_buffer: *mut c_void,
 ) -> OSStatus {
     let driver = _self as *mut PrismDriver;
+    let loopback_buffer = &mut (*driver).loopback_buffer;
+    let frames = _io_buffer_frame_size as usize;
+    let channels = 2;
+    let buffer_len = loopback_buffer.len();
+    let buffer_frames = buffer_len / channels;
 
-    if _operation_id == kAudioServerPlugInIOOperationReadInput {
-        let buffer = _io_main_buffer as *mut f32;
-        let frames = _io_buffer_frame_size as usize;
-        let channels = 2;
-        let freq = 440.0;
-        let sample_rate = 48000.0;
-        let phase_inc = 2.0 * std::f64::consts::PI * freq / sample_rate;
-
-        for i in 0..frames {
-            let sample = ((*driver).phase.sin() * 0.2) as f32;
-            (*driver).phase += phase_inc;
-            if (*driver).phase > 2.0 * std::f64::consts::PI {
-                (*driver).phase -= 2.0 * std::f64::consts::PI;
+    if _operation_id == kAudioServerPlugInIOOperationWriteMix {
+        if !_io_main_buffer.is_null() {
+            let input = _io_main_buffer as *const f32;
+            let mut w_pos = (*driver).write_pos.load(Ordering::Acquire);
+            
+            for i in 0..frames {
+                for c in 0..channels {
+                    let sample = *input.add(i * channels + c);
+                    loopback_buffer[w_pos * channels + c] = sample;
+                }
+                w_pos = (w_pos + 1) % buffer_frames;
             }
-
-            for c in 0..channels {
-                *buffer.add(i * channels + c) = sample;
+            (*driver).write_pos.store(w_pos, Ordering::Release);
+        }
+    } else if _operation_id == kAudioServerPlugInIOOperationReadInput {
+        if !_io_main_buffer.is_null() {
+            let output = _io_main_buffer as *mut f32;
+            let mut r_pos = (*driver).read_pos.load(Ordering::Acquire);
+            
+            for i in 0..frames {
+                for c in 0..channels {
+                    let sample = loopback_buffer[r_pos * channels + c];
+                    *output.add(i * channels + c) = sample;
+                }
+                r_pos = (r_pos + 1) % buffer_frames;
             }
+            (*driver).read_pos.store(r_pos, Ordering::Release);
         }
     }
     0
@@ -893,6 +912,7 @@ pub fn create_driver() -> *mut PrismDriver {
             let sample_rate = 48000.0; // Must match what we report in GetPropertyData
             let host_ticks_per_frame = host_ticks_per_second / sample_rate;
 
+            let buffer_size = 65536 * 2; // 65536 frames, 2 channels
             let driver = Box::new(PrismDriver {
                 _vtable: &raw const DRIVER_VTABLE,
                 ref_count: AtomicU32::new(1),
@@ -902,6 +922,9 @@ pub fn create_driver() -> *mut PrismDriver {
                 host_ticks_per_frame,
                 client_count: AtomicU32::new(0),
                 phase: 0.0,
+                loopback_buffer: vec![0.0; buffer_size],
+                write_pos: AtomicUsize::new(0),
+                read_pos: AtomicUsize::new(0),
             });
             DRIVER_INSTANCE = Box::into_raw(driver);
         } else {
