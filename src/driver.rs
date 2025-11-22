@@ -2,6 +2,58 @@ use coreaudio_sys::*;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::io::BufRead;
+
+#[derive(Debug, Clone, Copy)]
+pub struct PrismConfig {
+    pub buffer_frame_size: u32,
+    pub safety_offset: u32,
+    pub ring_buffer_frame_size: u32,
+    pub zero_timestamp_period: u32,
+}
+
+impl PrismConfig {
+    fn default() -> Self {
+        Self {
+            buffer_frame_size: 1024,
+            safety_offset: 256,
+            ring_buffer_frame_size: 1024,
+            zero_timestamp_period: 1024,
+        }
+    }
+
+    fn load() -> Self {
+        let mut config = Self::default();
+        let path = "/Library/Application Support/Prism/config.txt";
+
+        if let Ok(file) = std::fs::File::open(path) {
+            let reader = std::io::BufReader::new(file);
+            for line in reader.lines() {
+                if let Ok(l) = line {
+                    // Ignore comments
+                    if l.trim().starts_with('#') { continue; }
+                    let parts: Vec<&str> = l.split('=').collect();
+                    if parts.len() == 2 {
+                        let key = parts[0].trim();
+                        if let Ok(val) = parts[1].trim().parse::<u32>() {
+                            match key {
+                                "buffer_frame_size" => config.buffer_frame_size = val,
+                                "safety_offset" => config.safety_offset = val,
+                                "ring_buffer_frame_size" => config.ring_buffer_frame_size = val,
+                                "zero_timestamp_period" => config.zero_timestamp_period = val,
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            log_msg(&format!("Prism: Loaded config from {}", path));
+            return config;
+        }
+        log_msg("Prism: Using default config");
+        config
+    }
+}
 
 // Define the Host Interface struct locally since coreaudio-sys seems to treat it as opaque or we are having trouble dereferencing it.
 // This layout must match the C definition of AudioServerPlugInHostInterface.
@@ -25,6 +77,7 @@ pub struct PrismDriver {
     pub loopback_buffer: Vec<f32>,
     pub write_pos: AtomicUsize,
     pub read_pos: AtomicUsize,
+    pub config: PrismConfig,
 }
 
 // The singleton instance of our driver
@@ -540,7 +593,7 @@ unsafe extern "C" fn get_property_data(
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioDevicePropertySafetyOffset {
                 let out = _out_data as *mut UInt32;
-                *out = 256;
+                *out = (*driver).config.safety_offset;
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioDevicePropertyLatency {
                 let out = _out_data as *mut UInt32;
@@ -556,11 +609,11 @@ unsafe extern "C" fn get_property_data(
                 *_out_data_size = std::mem::size_of::<AudioValueRange>() as UInt32;
             } else if selector == kAudioDevicePropertyBufferFrameSize {
                 let out = _out_data as *mut UInt32;
-                *out = 1024;
+                *out = (*driver).config.buffer_frame_size;
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioDevicePropertyZeroTimeStampPeriod {
                 let out = _out_data as *mut UInt32;
-                *out = 1024;
+                *out = (*driver).config.zero_timestamp_period;
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioDevicePropertyBufferFrameSizeRange {
                 let out = _out_data as *mut AudioValueRange;
@@ -568,7 +621,7 @@ unsafe extern "C" fn get_property_data(
                 *_out_data_size = std::mem::size_of::<AudioValueRange>() as UInt32;
             } else if selector == kAudioDevicePropertyRingBufferFrameSize {
                 let out = _out_data as *mut UInt32;
-                *out = 1024;
+                *out = (*driver).config.ring_buffer_frame_size;
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioObjectPropertyOwnedObjects {
                 let out = _out_data as *mut AudioObjectID;
@@ -763,7 +816,7 @@ unsafe extern "C" fn get_zero_timestamp(
     }
 
     let current_host_time = libc::mach_absolute_time();
-    let period_frames = 1024.0; // kZeroTimeStampPeriod
+    let period_frames = (*driver).config.zero_timestamp_period as f64; // kZeroTimeStampPeriod
     let host_ticks_per_period = (*driver).host_ticks_per_frame * period_frames;
 
     // Calculate the next zero crossing based on anchor time
@@ -829,7 +882,7 @@ unsafe extern "C" fn do_io_operation(
         if !_io_main_buffer.is_null() {
             let input = _io_main_buffer as *const f32;
             let mut w_pos = (*driver).write_pos.load(Ordering::Acquire);
-            
+
             for i in 0..frames {
                 for c in 0..channels {
                     let sample = *input.add(i * channels + c);
@@ -843,7 +896,7 @@ unsafe extern "C" fn do_io_operation(
         if !_io_main_buffer.is_null() {
             let output = _io_main_buffer as *mut f32;
             let mut r_pos = (*driver).read_pos.load(Ordering::Acquire);
-            
+
             for i in 0..frames {
                 for c in 0..channels {
                     let sample = loopback_buffer[r_pos * channels + c];
@@ -912,6 +965,7 @@ pub fn create_driver() -> *mut PrismDriver {
             let sample_rate = 48000.0; // Must match what we report in GetPropertyData
             let host_ticks_per_frame = host_ticks_per_second / sample_rate;
 
+            let config = PrismConfig::load();
             let buffer_size = 65536 * 2; // 65536 frames, 2 channels
             let driver = Box::new(PrismDriver {
                 _vtable: &raw const DRIVER_VTABLE,
@@ -925,6 +979,7 @@ pub fn create_driver() -> *mut PrismDriver {
                 loopback_buffer: vec![0.0; buffer_size],
                 write_pos: AtomicUsize::new(0),
                 read_pos: AtomicUsize::new(0),
+                config,
             });
             DRIVER_INSTANCE = Box::into_raw(driver);
         } else {
