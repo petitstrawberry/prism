@@ -75,9 +75,14 @@ pub struct PrismDriver {
     pub client_count: AtomicU32,
     pub phase: f64,
     pub loopback_buffer: Vec<f32>,
-    pub write_pos: AtomicUsize,
-    pub read_pos: AtomicUsize,
     pub config: PrismConfig,
+
+    // Padding to prevent false sharing between write_pos and read_pos
+    // Cache line size is typically 64 bytes.
+    pub _pad1: [u8; 64],
+    pub write_pos: AtomicUsize,
+    pub _pad2: [u8; 64],
+    pub read_pos: AtomicUsize,
 }
 
 // The singleton instance of our driver
@@ -875,21 +880,41 @@ unsafe extern "C" fn do_io_operation(
     let loopback_buffer = &mut (*driver).loopback_buffer;
     let frames = _io_buffer_frame_size as usize;
     let channels = 2;
-    let buffer_len = loopback_buffer.len();
-    let buffer_frames = buffer_len / channels;
+    let buffer_len = loopback_buffer.len(); // Total samples in buffer
+    let buffer_frames = buffer_len / channels; // Total frames in buffer
 
     if _operation_id == kAudioServerPlugInIOOperationWriteMix {
         if !_io_main_buffer.is_null() {
             let input = _io_main_buffer as *const f32;
             let mut w_pos = (*driver).write_pos.load(Ordering::Acquire);
 
-            for i in 0..frames {
-                for c in 0..channels {
-                    let sample = *input.add(i * channels + c);
-                    loopback_buffer[w_pos * channels + c] = sample;
-                }
-                w_pos = (w_pos + 1) % buffer_frames;
+            // Calculate how many frames we can write before wrapping
+            let frames_until_wrap = buffer_frames - w_pos;
+
+            if frames <= frames_until_wrap {
+                // No wrapping needed
+                let src_ptr = input;
+                let dst_ptr = loopback_buffer.as_mut_ptr().add(w_pos * channels);
+                ptr::copy_nonoverlapping(src_ptr, dst_ptr, frames * channels);
+
+                w_pos += frames;
+                if w_pos >= buffer_frames { w_pos = 0; }
+            } else {
+                // Wrapping needed
+                // 1. Write until end
+                let src_ptr1 = input;
+                let dst_ptr1 = loopback_buffer.as_mut_ptr().add(w_pos * channels);
+                ptr::copy_nonoverlapping(src_ptr1, dst_ptr1, frames_until_wrap * channels);
+
+                // 2. Write remainder from start
+                let remainder = frames - frames_until_wrap;
+                let src_ptr2 = input.add(frames_until_wrap * channels);
+                let dst_ptr2 = loopback_buffer.as_mut_ptr(); // Start of buffer
+                ptr::copy_nonoverlapping(src_ptr2, dst_ptr2, remainder * channels);
+
+                w_pos = remainder;
             }
+
             (*driver).write_pos.store(w_pos, Ordering::Release);
         }
     } else if _operation_id == kAudioServerPlugInIOOperationReadInput {
@@ -897,13 +922,33 @@ unsafe extern "C" fn do_io_operation(
             let output = _io_main_buffer as *mut f32;
             let mut r_pos = (*driver).read_pos.load(Ordering::Acquire);
 
-            for i in 0..frames {
-                for c in 0..channels {
-                    let sample = loopback_buffer[r_pos * channels + c];
-                    *output.add(i * channels + c) = sample;
-                }
-                r_pos = (r_pos + 1) % buffer_frames;
+            // Calculate how many frames we can read before wrapping
+            let frames_until_wrap = buffer_frames - r_pos;
+
+            if frames <= frames_until_wrap {
+                // No wrapping needed
+                let src_ptr = loopback_buffer.as_ptr().add(r_pos * channels);
+                let dst_ptr = output;
+                ptr::copy_nonoverlapping(src_ptr, dst_ptr, frames * channels);
+
+                r_pos += frames;
+                if r_pos >= buffer_frames { r_pos = 0; }
+            } else {
+                // Wrapping needed
+                // 1. Read until end
+                let src_ptr1 = loopback_buffer.as_ptr().add(r_pos * channels);
+                let dst_ptr1 = output;
+                ptr::copy_nonoverlapping(src_ptr1, dst_ptr1, frames_until_wrap * channels);
+
+                // 2. Read remainder from start
+                let remainder = frames - frames_until_wrap;
+                let src_ptr2 = loopback_buffer.as_ptr(); // Start of buffer
+                let dst_ptr2 = output.add(frames_until_wrap * channels);
+                ptr::copy_nonoverlapping(src_ptr2, dst_ptr2, remainder * channels);
+
+                r_pos = remainder;
             }
+
             (*driver).read_pos.store(r_pos, Ordering::Release);
         }
     }
@@ -977,9 +1022,11 @@ pub fn create_driver() -> *mut PrismDriver {
                 client_count: AtomicU32::new(0),
                 phase: 0.0,
                 loopback_buffer: vec![0.0; buffer_size],
-                write_pos: AtomicUsize::new(0),
-                read_pos: AtomicUsize::new(0),
                 config,
+                _pad1: [0; 64],
+                write_pos: AtomicUsize::new(0),
+                _pad2: [0; 64],
+                read_pos: AtomicUsize::new(0),
             });
             DRIVER_INSTANCE = Box::into_raw(driver);
         } else {
