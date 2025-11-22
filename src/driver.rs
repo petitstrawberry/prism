@@ -535,7 +535,11 @@ unsafe extern "C" fn get_property_data(
                 let out = _out_data as *mut UInt32;
                 *out = 1;
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
-            } else if selector == kAudioDevicePropertySafetyOffset || selector == kAudioDevicePropertyLatency {
+            } else if selector == kAudioDevicePropertySafetyOffset {
+                let out = _out_data as *mut UInt32;
+                *out = 256;
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioDevicePropertyLatency {
                 let out = _out_data as *mut UInt32;
                 *out = 0;
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
@@ -549,11 +553,11 @@ unsafe extern "C" fn get_property_data(
                 *_out_data_size = std::mem::size_of::<AudioValueRange>() as UInt32;
             } else if selector == kAudioDevicePropertyBufferFrameSize {
                 let out = _out_data as *mut UInt32;
-                *out = 512;
+                *out = 1024;
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioDevicePropertyZeroTimeStampPeriod {
                 let out = _out_data as *mut UInt32;
-                *out = 512;
+                *out = 1024;
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioDevicePropertyBufferFrameSizeRange {
                 let out = _out_data as *mut AudioValueRange;
@@ -561,7 +565,7 @@ unsafe extern "C" fn get_property_data(
                 *_out_data_size = std::mem::size_of::<AudioValueRange>() as UInt32;
             } else if selector == kAudioDevicePropertyRingBufferFrameSize {
                 let out = _out_data as *mut UInt32;
-                *out = 512; // Same as BufferFrameSize
+                *out = 1024;
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioObjectPropertyOwnedObjects {
                 let out = _out_data as *mut AudioObjectID;
@@ -754,7 +758,7 @@ unsafe extern "C" fn get_zero_timestamp(
     }
 
     let current_host_time = libc::mach_absolute_time();
-    let period_frames = 512.0; // kZeroTimeStampPeriod
+    let period_frames = 1024.0; // kZeroTimeStampPeriod
     let host_ticks_per_period = (*driver).host_ticks_per_frame * period_frames;
 
     // Calculate the next zero crossing based on anchor time
