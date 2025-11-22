@@ -1,24 +1,11 @@
 use coreaudio_sys::*;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 // Define the Host Interface struct locally since coreaudio-sys seems to treat it as opaque or we are having trouble dereferencing it.
 // This layout must match the C definition of AudioServerPlugInHostInterface.
-#[repr(C)]
-#[allow(non_snake_case)]
-pub struct PrismHostInterface {
-    pub _reserved: *mut c_void,
-    pub QueryInterface: Option<unsafe extern "C" fn(inDriver: *mut c_void, inUUID: *const c_void, outInterface: *mut *mut c_void) -> HRESULT>,
-    pub AddRef: Option<unsafe extern "C" fn(inDriver: *mut c_void) -> ULONG>,
-    pub Release: Option<unsafe extern "C" fn(inDriver: *mut c_void) -> ULONG>,
-    pub CreateDevice: Option<unsafe extern "C" fn(inHost: AudioServerPlugInHostRef, inDescription: CFDictionaryRef, outDeviceID: *mut AudioObjectID) -> OSStatus>,
-    pub DestroyDevice: Option<unsafe extern "C" fn(inHost: AudioServerPlugInHostRef, inDeviceID: AudioObjectID) -> OSStatus>,
-    pub AddDeviceClient: Option<unsafe extern "C" fn(inHost: AudioServerPlugInHostRef, inDeviceID: AudioObjectID, inClientInfo: *const AudioServerPlugInClientInfo) -> OSStatus>,
-    pub RemoveDeviceClient: Option<unsafe extern "C" fn(inHost: AudioServerPlugInHostRef, inDeviceID: AudioObjectID, inClientInfo: *const AudioServerPlugInClientInfo) -> OSStatus>,
-    pub PerformDeviceConfigurationChange: Option<unsafe extern "C" fn(inHost: AudioServerPlugInHostRef, inDeviceID: AudioObjectID, inChangeAction: u64, inChangeInfo: *mut c_void) -> OSStatus>,
-    pub RequestDeviceConfigurationChange: Option<unsafe extern "C" fn(inHost: AudioServerPlugInHostRef, inDeviceID: AudioObjectID, inChangeAction: u64, inChangeInfo: *mut c_void) -> OSStatus>,
-}
+// Removed PrismHostInterface as it is not used yet.
 
 // UUID for the driver interface (kAudioServerPlugInDriverInterfaceUUID)
 // This should match what is expected by Core Audio.
@@ -30,10 +17,29 @@ pub struct PrismDriver {
     pub _vtable: *const AudioServerPlugInDriverInterface,
     pub ref_count: AtomicU32,
     pub host: Option<AudioServerPlugInHostRef>,
+    pub anchor_host_time: AtomicU64,
+    pub num_time_stamps: AtomicU64,
+    pub host_ticks_per_frame: f64,
+    pub client_count: AtomicU32,
 }
 
 // The singleton instance of our driver
 static mut DRIVER_INSTANCE: *mut PrismDriver = ptr::null_mut();
+
+fn get_host_ticks_per_second() -> f64 {
+    let mut info = libc::mach_timebase_info_data_t { numer: 0, denom: 0 };
+    unsafe {
+        libc::mach_timebase_info(&mut info);
+    }
+    if info.numer == 0 || info.denom == 0 {
+        return 1_000_000_000.0;
+    }
+    // ticks * numer / denom = nanoseconds
+    // 1 sec = 1e9 ns
+    // ticks_per_sec * numer / denom = 1e9
+    // ticks_per_sec = 1e9 * denom / numer
+    1_000_000_000.0 * (info.denom as f64) / (info.numer as f64)
+}
 
 // --- IUnknown Implementation ---
 
@@ -138,11 +144,16 @@ const kAudioPlugInPropertyDeviceList: AudioObjectPropertySelector = 0x64657623; 
 const kAudioPlugInPropertyResourceBundle: AudioObjectPropertySelector = 0x72737263; // 'rsrc'
 #[allow(non_upper_case_globals)]
 const kAudioPlugInPropertyTranslateUIDToDevice: AudioObjectPropertySelector = 0x75696464; // 'uidd'
-
-extern "C" {
-    fn mach_absolute_time() -> u64;
-    fn CFStringCompare(theString1: CFStringRef, theString2: CFStringRef, compareOptions: CFOptionFlags) -> CFComparisonResult;
-}
+#[allow(non_upper_case_globals)]
+const kAudioObjectPropertyScope: AudioObjectPropertySelector = 0x73636F70; // 'scop'
+#[allow(non_upper_case_globals)]
+const kAudioObjectPropertyElement: AudioObjectPropertySelector = 0x656C656D; // 'elem'
+#[allow(non_upper_case_globals)]
+const kAudioDevicePropertyBufferFrameSize: AudioObjectPropertySelector = 0x6673697A; // 'fsiz'
+#[allow(non_upper_case_globals)]
+const kAudioDevicePropertyBufferFrameSizeRange: AudioObjectPropertySelector = 0x66737A72; // 'fszr'
+#[allow(non_upper_case_globals)]
+const kAudioObjectPropertyControlList: AudioObjectPropertySelector = 0x6374726C; // 'ctrl'
 
 #[allow(non_upper_case_globals)]
 unsafe extern "C" fn has_property(
@@ -153,7 +164,7 @@ unsafe extern "C" fn has_property(
 ) -> Boolean {
     let address = *_address;
     let selector = address.mSelector;
-    
+
     let res = match object_id {
         id if id == kAudioObjectPlugInObject => {
             if selector == kAudioObjectPropertyBaseClass ||
@@ -175,6 +186,7 @@ unsafe extern "C" fn has_property(
                selector == kAudioObjectPropertyOwner ||
                selector == kAudioObjectPropertyManufacturer ||
                selector == kAudioObjectPropertyOwnedObjects ||
+               selector == kAudioObjectPropertyControlList ||
                selector == kAudioDevicePropertyStreams ||
                selector == kAudioDevicePropertyDeviceUID ||
                selector == kAudioDevicePropertyModelUID ||
@@ -185,8 +197,15 @@ unsafe extern "C" fn has_property(
                selector == kAudioDevicePropertyDeviceCanBeDefaultSystemDevice ||
                selector == kAudioDevicePropertySafetyOffset ||
                selector == kAudioDevicePropertyLatency ||
+               selector == kAudioDevicePropertyDeviceIsAlive ||
                selector == kAudioDevicePropertyNominalSampleRate ||
-               selector == kAudioDevicePropertyAvailableNominalSampleRates {
+               selector == kAudioDevicePropertyAvailableNominalSampleRates ||
+               selector == kAudioDevicePropertyBufferFrameSize ||
+               selector == kAudioDevicePropertyBufferFrameSizeRange ||
+               selector == kAudioDevicePropertyZeroTimeStampPeriod ||
+               selector == kAudioObjectPropertyScope ||
+               selector == kAudioObjectPropertyElement ||
+               selector == kAudioDevicePropertyBufferFrameSize {
                 true
             } else {
                 false
@@ -196,14 +215,12 @@ unsafe extern "C" fn has_property(
             if selector == kAudioObjectPropertyBaseClass ||
                selector == kAudioObjectPropertyClass ||
                selector == kAudioObjectPropertyOwner ||
+               selector == kAudioObjectPropertyControlList ||
                selector == kAudioStreamPropertyDirection ||
                selector == kAudioStreamPropertyTerminalType ||
                selector == kAudioStreamPropertyStartingChannel ||
-               selector == kAudioStreamPropertyVirtualFormat ||
-               selector == kAudioStreamPropertyPhysicalFormat ||
-               selector == kAudioStreamPropertyPhysicalFormats ||
-               selector == kAudioStreamPropertyAvailableVirtualFormats ||
-               selector == kAudioStreamPropertyAvailablePhysicalFormats {
+               selector == kAudioObjectPropertyScope ||
+               selector == kAudioObjectPropertyElement {
                 true
             } else {
                 false
@@ -260,7 +277,9 @@ unsafe extern "C" fn get_property_data_size(
             }
         },
         DEVICE_ID => {
-            if selector == kAudioObjectPropertyBaseClass ||
+            if selector == kAudioObjectPropertyControlList {
+                *_out_data_size = 0;
+            } else if selector == kAudioObjectPropertyBaseClass ||
                selector == kAudioObjectPropertyClass ||
                selector == kAudioObjectPropertyOwner ||
                selector == kAudioDevicePropertyTransportType ||
@@ -268,7 +287,11 @@ unsafe extern "C" fn get_property_data_size(
                selector == kAudioDevicePropertyDeviceCanBeDefaultDevice ||
                selector == kAudioDevicePropertyDeviceCanBeDefaultSystemDevice ||
                selector == kAudioDevicePropertySafetyOffset ||
-               selector == kAudioDevicePropertyLatency {
+               selector == kAudioDevicePropertyLatency ||
+               selector == kAudioDevicePropertyDeviceIsAlive ||
+               selector == kAudioDevicePropertyZeroTimeStampPeriod ||
+               selector == kAudioObjectPropertyScope ||
+               selector == kAudioObjectPropertyElement {
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioObjectPropertyManufacturer ||
                       selector == kAudioDevicePropertyDeviceUID ||
@@ -279,19 +302,24 @@ unsafe extern "C" fn get_property_data_size(
                 *_out_data_size = (2 * std::mem::size_of::<AudioObjectID>()) as UInt32;
             } else if selector == kAudioDevicePropertyNominalSampleRate {
                 *_out_data_size = std::mem::size_of::<Float64>() as UInt32;
-            } else if selector == kAudioDevicePropertyAvailableNominalSampleRates {
+            } else if selector == kAudioDevicePropertyAvailableNominalSampleRates ||
+                      selector == kAudioDevicePropertyBufferFrameSizeRange {
                 *_out_data_size = std::mem::size_of::<AudioValueRange>() as UInt32;
             } else {
                 return kAudioHardwareUnknownPropertyError as OSStatus;
             }
         },
         INPUT_STREAM_ID | OUTPUT_STREAM_ID => {
-            if selector == kAudioObjectPropertyBaseClass ||
+            if selector == kAudioObjectPropertyControlList {
+                *_out_data_size = 0;
+            } else if selector == kAudioObjectPropertyBaseClass ||
                selector == kAudioObjectPropertyClass ||
                selector == kAudioObjectPropertyOwner ||
                selector == kAudioStreamPropertyDirection ||
                selector == kAudioStreamPropertyTerminalType ||
-               selector == kAudioStreamPropertyStartingChannel {
+               selector == kAudioStreamPropertyStartingChannel ||
+               selector == kAudioObjectPropertyScope ||
+               selector == kAudioObjectPropertyElement {
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioStreamPropertyVirtualFormat ||
                       selector == kAudioStreamPropertyPhysicalFormat {
@@ -321,9 +349,14 @@ unsafe extern "C" fn get_property_data(
     _out_data_size: *mut UInt32,
     _out_data: *mut c_void,
 ) -> OSStatus {
+    let driver = _self as *mut PrismDriver;
     let address = *_address;
     let selector = address.mSelector;
-    log_msg(&format!("Prism: GetPropertyData called. Object: {}, Selector: {}", object_id, selector));
+    // log_msg(&format!("Prism: GetPropertyData called. Object: {}, Selector: {}", object_id, selector));
+
+    if _out_data.is_null() {
+        return kAudioHardwareIllegalOperationError as OSStatus;
+    }
 
     match object_id {
         id if id == kAudioObjectPlugInObject => {
@@ -357,7 +390,7 @@ unsafe extern "C" fn get_property_data(
                 // But usually the HAL asks this with the UID in the qualifier?
                 // Wait, the spec says the UID is passed as the qualifier?
                 // "The qualifier is a CFStringRef that contains the UID."
-                
+
                 // Let's check if we have qualifier data
                 let mut device_id = kAudioObjectUnknown;
                 if _qualifier_data_size == std::mem::size_of::<CFStringRef>() as UInt32 && !_qualifier_data.is_null() {
@@ -368,7 +401,7 @@ unsafe extern "C" fn get_property_data(
                      }
                      CFRelease(my_uid as *const c_void);
                 }
-                
+
                 let out = _out_data as *mut AudioObjectID;
                 *out = device_id;
                 *_out_data_size = std::mem::size_of::<AudioObjectID>() as UInt32;
@@ -377,7 +410,9 @@ unsafe extern "C" fn get_property_data(
             }
         },
         DEVICE_ID => {
-            if selector == kAudioObjectPropertyBaseClass {
+            if selector == kAudioObjectPropertyControlList {
+                *_out_data_size = 0;
+            } else if selector == kAudioObjectPropertyBaseClass {
                 let out = _out_data as *mut AudioClassID;
                 *out = kAudioObjectClassID;
                 *_out_data_size = std::mem::size_of::<AudioClassID>() as UInt32;
@@ -411,7 +446,19 @@ unsafe extern "C" fn get_property_data(
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioDevicePropertyDeviceIsRunning {
                 let out = _out_data as *mut UInt32;
-                *out = 0;
+                *out = if (*driver).client_count.load(Ordering::SeqCst) > 0 { 1 } else { 0 };
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioDevicePropertyDeviceIsAlive {
+                let out = _out_data as *mut UInt32;
+                *out = 1;
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioObjectPropertyScope {
+                let out = _out_data as *mut UInt32;
+                *out = kAudioObjectPropertyScopeGlobal;
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioObjectPropertyElement {
+                let out = _out_data as *mut UInt32;
+                *out = kAudioObjectPropertyElementMaster;
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioDevicePropertyDeviceCanBeDefaultDevice {
                 let out = _out_data as *mut UInt32;
@@ -433,6 +480,18 @@ unsafe extern "C" fn get_property_data(
                 let out = _out_data as *mut AudioValueRange;
                 *out = AudioValueRange { mMinimum: 48000.0, mMaximum: 48000.0 };
                 *_out_data_size = std::mem::size_of::<AudioValueRange>() as UInt32;
+            } else if selector == kAudioDevicePropertyBufferFrameSize {
+                let out = _out_data as *mut UInt32;
+                *out = 512;
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioDevicePropertyZeroTimeStampPeriod {
+                let out = _out_data as *mut UInt32;
+                *out = 10000;
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioDevicePropertyBufferFrameSizeRange {
+                let out = _out_data as *mut AudioValueRange;
+                *out = AudioValueRange { mMinimum: 16.0, mMaximum: 4096.0 };
+                *_out_data_size = std::mem::size_of::<AudioValueRange>() as UInt32;
             } else if selector == kAudioObjectPropertyOwnedObjects || selector == kAudioDevicePropertyStreams {
                 let out = _out_data as *mut AudioObjectID;
                 *out.offset(0) = INPUT_STREAM_ID;
@@ -443,7 +502,9 @@ unsafe extern "C" fn get_property_data(
             }
         },
         INPUT_STREAM_ID | OUTPUT_STREAM_ID => {
-            if selector == kAudioObjectPropertyBaseClass {
+            if selector == kAudioObjectPropertyControlList {
+                *_out_data_size = 0;
+            } else if selector == kAudioObjectPropertyBaseClass {
                 let out = _out_data as *mut AudioClassID;
                 *out = kAudioObjectClassID;
                 *_out_data_size = std::mem::size_of::<AudioClassID>() as UInt32;
@@ -455,6 +516,14 @@ unsafe extern "C" fn get_property_data(
                 let out = _out_data as *mut AudioObjectID;
                 *out = DEVICE_ID;
                 *_out_data_size = std::mem::size_of::<AudioObjectID>() as UInt32;
+            } else if selector == kAudioObjectPropertyScope {
+                let out = _out_data as *mut UInt32;
+                *out = if object_id == INPUT_STREAM_ID { kAudioObjectPropertyScopeInput } else { kAudioObjectPropertyScopeOutput };
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioObjectPropertyElement {
+                let out = _out_data as *mut UInt32;
+                *out = kAudioObjectPropertyElementMaster;
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioStreamPropertyDirection {
                 let out = _out_data as *mut UInt32;
                 *out = if object_id == INPUT_STREAM_ID { 1 } else { 0 };
@@ -482,7 +551,7 @@ unsafe extern "C" fn get_property_data(
                     mReserved: 0,
                 };
                 *_out_data_size = std::mem::size_of::<AudioStreamBasicDescription>() as UInt32;
-            } else if selector == kAudioStreamPropertyPhysicalFormats || 
+            } else if selector == kAudioStreamPropertyPhysicalFormats ||
                       selector == kAudioStreamPropertyAvailableVirtualFormats ||
                       selector == kAudioStreamPropertyAvailablePhysicalFormats {
                 let out = _out_data as *mut AudioStreamRangedDescription;
@@ -523,24 +592,63 @@ unsafe extern "C" fn set_property_data(
     0
 }
 
+#[allow(deprecated)]
 unsafe extern "C" fn start_io(
     _self: AudioServerPlugInDriverRef,
     _device_id: AudioObjectID,
     _client_id: UInt32,
 ) -> OSStatus {
     log_msg("Prism: StartIO called");
+    let driver = _self as *mut PrismDriver;
+
+    let prev_count = (*driver).client_count.fetch_add(1, Ordering::SeqCst);
+    if prev_count == 0 {
+        let now = libc::mach_absolute_time();
+        (*driver).anchor_host_time.store(now, Ordering::SeqCst);
+        (*driver).num_time_stamps.store(0, Ordering::SeqCst);
+
+        if let Some(host) = (*driver).host {
+             let address = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyDeviceIsRunning,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMaster,
+            };
+            if let Some(prop_changed) = (*host).PropertiesChanged {
+                prop_changed(host, _device_id, 1, &address);
+            }
+        }
+    }
     0
 }
 
+#[allow(deprecated)]
 unsafe extern "C" fn stop_io(
     _self: AudioServerPlugInDriverRef,
     _device_id: AudioObjectID,
     _client_id: UInt32,
 ) -> OSStatus {
     log_msg("Prism: StopIO called");
+    let driver = _self as *mut PrismDriver;
+
+    let prev_count = (*driver).client_count.fetch_sub(1, Ordering::SeqCst);
+    if prev_count == 1 {
+        (*driver).anchor_host_time.store(0, Ordering::SeqCst);
+
+        if let Some(host) = (*driver).host {
+             let address = AudioObjectPropertyAddress {
+                mSelector: kAudioDevicePropertyDeviceIsRunning,
+                mScope: kAudioObjectPropertyScopeGlobal,
+                mElement: kAudioObjectPropertyElementMaster,
+            };
+            if let Some(prop_changed) = (*host).PropertiesChanged {
+                prop_changed(host, _device_id, 1, &address);
+            }
+        }
+    }
     0
 }
 
+#[allow(deprecated)]
 unsafe extern "C" fn get_zero_timestamp(
     _self: AudioServerPlugInDriverRef,
     _device_id: AudioObjectID,
@@ -549,24 +657,37 @@ unsafe extern "C" fn get_zero_timestamp(
     out_host_time: *mut UInt64,
     out_seed: *mut UInt64,
 ) -> OSStatus {
-    // Do not log here to avoid flooding
-    // log_msg("Prism: GetZeroTimeStamp called");
-    
-    let now = mach_absolute_time();
-    // A real driver would calculate sample time based on a start time and sample rate.
-    // For now, we just return a dummy incrementing time or just 0 if we are not "running".
-    // But since we return 0 for StartIO, the system thinks we are running.
-    
-    // We should probably track if we are running.
-    // But for now, let's just return valid pointers.
-    
-    *out_sample_time = 0.0; // TODO: Implement proper timing
-    *out_host_time = now;
+    let driver = _self as *mut PrismDriver;
+    let anchor = (*driver).anchor_host_time.load(Ordering::SeqCst);
+
+    if anchor == 0 {
+        *out_sample_time = 0.0;
+        *out_host_time = 0;
+        *out_seed = 0;
+        return 0;
+    }
+
+    let current_host_time = libc::mach_absolute_time();
+    let period_frames = 10000.0; // kZeroTimeStampPeriod
+    let host_ticks_per_period = (*driver).host_ticks_per_frame * period_frames;
+
+    // Calculate the next zero crossing based on anchor time
+    // We want the smallest N such that anchor + N * period > current_time
+    let elapsed_ticks = if current_host_time > anchor {
+        current_host_time - anchor
+    } else {
+        0
+    };
+
+    let num_periods = (elapsed_ticks as f64 / host_ticks_per_period).floor() as u64;
+    let next_period = num_periods + 1;
+
+    *out_sample_time = next_period as f64 * period_frames;
+    *out_host_time = anchor + (next_period as f64 * host_ticks_per_period) as u64;
     *out_seed = 1;
-    
+
     0
 }
-
 unsafe extern "C" fn will_do_io_operation(
     _self: AudioServerPlugInDriverRef,
     _device_id: AudioObjectID,
@@ -575,6 +696,8 @@ unsafe extern "C" fn will_do_io_operation(
     _out_will_do: *mut Boolean,
     _out_will_do_in_place: *mut Boolean,
 ) -> OSStatus {
+    *_out_will_do = 1;
+    *_out_will_do_in_place = 1;
     0
 }
 
@@ -616,9 +739,11 @@ unsafe extern "C" fn end_io_operation(
 
 // Helper for logging
 fn log_msg(msg: &str) {
-    unsafe {
-        let c_msg = std::ffi::CString::new(msg).unwrap();
-        libc::syslog(libc::LOG_NOTICE, c_msg.as_ptr());
+    use std::io::Write;
+    // Use a fixed path in /tmp to ensure we can write to it and find it.
+    // Ignoring errors as we can't do much if logging fails.
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/prism.log") {
+        let _ = writeln!(file, "{}", msg);
     }
 }
 
@@ -652,10 +777,18 @@ static mut DRIVER_VTABLE: AudioServerPlugInDriverInterface = AudioServerPlugInDr
 pub fn create_driver() -> *mut PrismDriver {
     unsafe {
         if DRIVER_INSTANCE.is_null() {
+            let host_ticks_per_second = get_host_ticks_per_second();
+            let sample_rate = 48000.0; // Must match what we report in GetPropertyData
+            let host_ticks_per_frame = host_ticks_per_second / sample_rate;
+
             let driver = Box::new(PrismDriver {
                 _vtable: &raw const DRIVER_VTABLE,
                 ref_count: AtomicU32::new(1),
                 host: None,
+                anchor_host_time: AtomicU64::new(0),
+                num_time_stamps: AtomicU64::new(0),
+                host_ticks_per_frame,
+                client_count: AtomicU32::new(0),
             });
             DRIVER_INSTANCE = Box::into_raw(driver);
         } else {
