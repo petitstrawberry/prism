@@ -1,8 +1,10 @@
 use coreaudio_sys::*;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, AtomicI32, Ordering};
 use std::io::BufRead;
+// use std::collections::HashMap; // Removed
+// use std::sync::RwLock; // Removed
 
 #[derive(Debug, Clone, Copy)]
 pub struct PrismConfig {
@@ -20,7 +22,7 @@ impl PrismConfig {
             safety_offset: 256,
             ring_buffer_frame_size: 1024,
             zero_timestamp_period: 1024,
-            num_channels: 16, // Default to 16 channels for routing
+            num_channels: 64, // Increased to 64 for OMNIBUS-style routing
         }
     }
 
@@ -67,6 +69,14 @@ impl PrismConfig {
 // In coreaudio-sys, this might be available as a constant, but often we need to construct it.
 // For now, we'll use the standard UUID for the driver interface.
 
+const MAX_CLIENTS: usize = 4096; // Increased for Direct Indexing
+
+pub struct ClientSlot {
+    pub client_id: AtomicU32,
+    pub channel_offset: AtomicUsize,
+    pub pid: AtomicI32,
+}
+
 #[repr(C)]
 pub struct PrismDriver {
     pub _vtable: *const AudioServerPlugInDriverInterface,
@@ -86,9 +96,10 @@ pub struct PrismDriver {
     pub write_pos: AtomicUsize,
     pub _pad2: [u8; 64],
     pub read_pos: AtomicUsize,
-}
 
-// The singleton instance of our driver
+    // Fixed size array of client slots for lock-free access in IO path
+    pub client_slots: Vec<ClientSlot>,
+}// The singleton instance of our driver
 static mut DRIVER_INSTANCE: *mut PrismDriver = ptr::null_mut();
 
 #[allow(deprecated)]
@@ -143,7 +154,7 @@ unsafe extern "C" fn initialize(
     _self: AudioServerPlugInDriverRef,
     host: AudioServerPlugInHostRef,
 ) -> OSStatus {
-    // log_msg("Prism: Initialize called");
+    log_msg("Prism: Initialize called");
     let driver = _self as *mut PrismDriver;
     (*driver).host = Some(host);
     0
@@ -170,6 +181,29 @@ unsafe extern "C" fn add_device_client(
     _device_id: AudioObjectID,
     _client_id: *const AudioServerPlugInClientInfo,
 ) -> OSStatus {
+    let driver = _self as *mut PrismDriver;
+    if !_client_id.is_null() {
+        // Cast to our custom struct to access mBundleID
+        let client_info = &*(_client_id as *const PrismClientInfo);
+        let client_id = client_info.mClientID;
+        let pid = client_info.mProcessID;
+
+        // Direct Indexing for slot
+        let idx = (client_id as usize) & (MAX_CLIENTS - 1);
+        let slots = &(*driver).client_slots;
+        let slot = &slots[idx];
+
+        // Prism 2.0: Dumb Driver
+        // We default to channel 0 (Passthrough) or a specific "unassigned" state.
+        // The Daemon will update this via SetProperty('rout').
+        let channel_offset = 0;
+
+        log_msg(&format!("Prism: Client Added. ID={}, PID={}, Slot={}, Default Offset={}", client_id, pid, idx, channel_offset));
+
+        slot.channel_offset.store(channel_offset, Ordering::SeqCst);
+        slot.pid.store(pid as i32, Ordering::SeqCst);
+        slot.client_id.store(client_id, Ordering::Release);
+    }
     0
 }
 
@@ -178,6 +212,25 @@ unsafe extern "C" fn remove_device_client(
     _device_id: AudioObjectID,
     _client_id: *const AudioServerPlugInClientInfo,
 ) -> OSStatus {
+    let driver = _self as *mut PrismDriver;
+    if !_client_id.is_null() {
+        let client_info = &*_client_id;
+        let client_id = client_info.mClientID;
+        let pid = client_info.mProcessID;
+
+        log_msg(&format!("Prism: Client Removed. ID={}, PID={}", client_id, pid));
+
+        let idx = (client_id as usize) & (MAX_CLIENTS - 1);
+        let slots = &(*driver).client_slots;
+        let slot = &slots[idx];
+        let id = slot.client_id.load(Ordering::SeqCst);
+
+        if id == client_id {
+            slot.client_id.store(0, Ordering::Release); // Reset to 0
+            slot.channel_offset.store(0, Ordering::Relaxed);
+            slot.pid.store(0, Ordering::Relaxed);
+        }
+    }
     0
 }
 
@@ -234,6 +287,13 @@ const kAudioDevicePropertyIsHidden: AudioObjectPropertySelector = 0x6869646E; //
 const kAudioObjectPropertyName: AudioObjectPropertySelector = 0x6C6E616D; // 'lnam'
 #[allow(non_upper_case_globals)]
 const kAudioDevicePropertyRingBufferFrameSize: AudioObjectPropertySelector = 0x72696E67; // 'ring'
+const kAudioPrismPropertyRoutingTable: AudioObjectPropertySelector = 0x726F7574; // 'rout'
+
+#[repr(C)]
+struct PrismRoutingUpdate {
+    client_id: u32,
+    channel_offset: u32,
+}
 
 #[allow(non_upper_case_globals)]
 unsafe extern "C" fn has_property(
@@ -292,7 +352,8 @@ unsafe extern "C" fn has_property(
                selector == kAudioDevicePropertyClockSource ||
                selector == kAudioObjectPropertyScope ||
                selector == kAudioObjectPropertyElement ||
-               selector == kAudioDevicePropertyBufferFrameSize {
+               selector == kAudioDevicePropertyBufferFrameSize ||
+               selector == kAudioPrismPropertyRoutingTable {
                 true
             } else {
                 false
@@ -332,7 +393,14 @@ unsafe extern "C" fn is_property_settable(
     _address: *const AudioObjectPropertyAddress,
     _out_is_settable: *mut Boolean,
 ) -> OSStatus {
-    *_out_is_settable = 0;
+    let address = *_address;
+    let selector = address.mSelector;
+    
+    if selector == kAudioPrismPropertyRoutingTable {
+        *_out_is_settable = 1;
+    } else {
+        *_out_is_settable = 0;
+    }
     0
 }
 
@@ -415,6 +483,8 @@ unsafe extern "C" fn get_property_data_size(
                 *_out_data_size = std::mem::size_of::<AudioValueRange>() as UInt32;
             } else if selector == kAudioDevicePropertyRingBufferFrameSize {
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioPrismPropertyRoutingTable {
+                *_out_data_size = 0;
             } else {
                 log_msg(&format!("Prism: GetPropertyDataSize called. Object: {}, Selector: {}", object_id, selector));
                 return kAudioHardwareUnknownPropertyError as OSStatus;
@@ -502,7 +572,6 @@ unsafe extern "C" fn get_property_data(
                 // Check if the UID matches our device UID
                 // For simplicity, we assume it matches if we are asked, or we should check the qualifier.
                 // But usually the HAL asks this with the UID in the qualifier?
-                // Wait, the spec says the UID is passed as the qualifier?
                 // "The qualifier is a CFStringRef that contains the UID."
 
                 // Let's check if we have qualifier data
@@ -631,6 +700,8 @@ unsafe extern "C" fn get_property_data(
                 let out = _out_data as *mut UInt32;
                 *out = (*driver).config.ring_buffer_frame_size;
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioPrismPropertyRoutingTable {
+                *_out_data_size = 0;
             } else if selector == kAudioObjectPropertyOwnedObjects {
                 let out = _out_data as *mut AudioObjectID;
                 *out.offset(0) = INPUT_STREAM_ID;
@@ -743,7 +814,39 @@ unsafe extern "C" fn set_property_data(
     _in_data_size: UInt32,
     _in_data: *const c_void,
 ) -> OSStatus {
-    0
+    let driver = _self as *mut PrismDriver;
+    let address = *_address;
+    let selector = address.mSelector;
+
+    if selector == kAudioPrismPropertyRoutingTable {
+        if _in_data_size % 8 != 0 { // sizeof(u32) * 2 = 8
+            return kAudioHardwareBadPropertySizeError as OSStatus;
+        }
+        let count = _in_data_size / 8;
+        let updates = _in_data as *const PrismRoutingUpdate;
+        
+        for i in 0..count {
+            let update = &*updates.add(i as usize);
+            let client_id = update.client_id;
+            let offset = update.channel_offset;
+            
+            // Update the slot
+            let idx = (client_id as usize) & (MAX_CLIENTS - 1);
+            let slots = &(*driver).client_slots;
+            let slot = &slots[idx];
+            
+            // Verify it's the right client
+            if slot.client_id.load(Ordering::Acquire) == client_id {
+                slot.channel_offset.store(offset as usize, Ordering::Release);
+                log_msg(&format!("Prism: Routing Update. Client={}, Offset={}", client_id, offset));
+            } else {
+                log_msg(&format!("Prism: Routing Update Failed. Client={} not found in slot {}", client_id, idx));
+            }
+        }
+        return 0;
+    }
+    
+    kAudioHardwareUnknownPropertyError as OSStatus
 }
 
 #[allow(deprecated)]
@@ -752,7 +855,7 @@ unsafe extern "C" fn start_io(
     _device_id: AudioObjectID,
     _client_id: UInt32,
 ) -> OSStatus {
-    // log_msg("Prism: StartIO called");
+    log_msg("Prism: StartIO called");
     let driver = _self as *mut PrismDriver;
 
     let prev_count = (*driver).client_count.fetch_add(1, Ordering::SeqCst);
@@ -886,56 +989,91 @@ unsafe extern "C" fn do_io_operation(
     let buffer_len = loopback_buffer.len(); // Total samples in buffer
     let buffer_frames = buffer_len / channels; // Total frames in buffer
 
+    if _io_cycle_info.is_null() {
+        return kAudioHardwareIllegalOperationError as OSStatus;
+    }
+    #[allow(unused_variables)]
+    let cycle_info = &*_io_cycle_info;
+
     if _operation_id == kAudioServerPlugInIOOperationWriteMix {
         if !_io_main_buffer.is_null() {
+            // Direct Indexing
+            let idx = (_client_id as usize) & (MAX_CLIENTS - 1);
+            let slots = &(*driver).client_slots;
+            let slot = &slots[idx];
+
+            // Verify Client ID
+            if slot.client_id.load(Ordering::Acquire) != _client_id {
+                return 0;
+            }
+            let channel_offset = slot.channel_offset.load(Ordering::Relaxed);
+
             let input = _io_main_buffer as *const f32;
-            let mut w_pos = (*driver).write_pos.load(Ordering::Acquire);
-            
+            // Use mOutputTime to determine write position in ring buffer
+            // This ensures all clients writing to the same time slot write to the same buffer index
+            let sample_time = cycle_info.mOutputTime.mSampleTime as usize;
+            let w_pos = sample_time % buffer_frames;
+
             // Calculate how many frames we can write before wrapping
             let frames_until_wrap = buffer_frames - w_pos;
-            
+            let input_channels = channels; // The buffer is 16ch interleaved
+
             if frames <= frames_until_wrap {
                 // No wrapping needed
-                let src_ptr = input;
-                let dst_ptr = loopback_buffer.as_mut_ptr().add(w_pos * channels);
-                ptr::copy_nonoverlapping(src_ptr, dst_ptr, frames * channels);
-                
-                w_pos += frames;
-                if w_pos >= buffer_frames { w_pos = 0; }
+                for i in 0..frames {
+                    let in_l = *input.add(i * input_channels + 0);
+                    let in_r = *input.add(i * input_channels + 1);
+
+                    let dst_idx = (w_pos + i) * channels + channel_offset;
+                    if dst_idx + 1 < buffer_len {
+                        loopback_buffer[dst_idx] += in_l;
+                        loopback_buffer[dst_idx + 1] += in_r;
+                    }
+                }
             } else {
                 // Wrapping needed
-                // 1. Write until end
-                let src_ptr1 = input;
-                let dst_ptr1 = loopback_buffer.as_mut_ptr().add(w_pos * channels);
-                ptr::copy_nonoverlapping(src_ptr1, dst_ptr1, frames_until_wrap * channels);
-                
-                // 2. Write remainder from start
+                for i in 0..frames_until_wrap {
+                    let in_l = *input.add(i * input_channels + 0);
+                    let in_r = *input.add(i * input_channels + 1);
+                    let dst_idx = (w_pos + i) * channels + channel_offset;
+                    if dst_idx + 1 < buffer_len {
+                        loopback_buffer[dst_idx] += in_l;
+                        loopback_buffer[dst_idx + 1] += in_r;
+                    }
+                }
+
                 let remainder = frames - frames_until_wrap;
-                let src_ptr2 = input.add(frames_until_wrap * channels);
-                let dst_ptr2 = loopback_buffer.as_mut_ptr(); // Start of buffer
-                ptr::copy_nonoverlapping(src_ptr2, dst_ptr2, remainder * channels);
-                
-                w_pos = remainder;
+                for i in 0..remainder {
+                    let src_idx = frames_until_wrap + i;
+                    let in_l = *input.add(src_idx * input_channels + 0);
+                    let in_r = *input.add(src_idx * input_channels + 1);
+                    let dst_idx = i * channels + channel_offset;
+                     if dst_idx + 1 < buffer_len {
+                        loopback_buffer[dst_idx] += in_l;
+                        loopback_buffer[dst_idx + 1] += in_r;
+                    }
+                }
             }
-            
-            (*driver).write_pos.store(w_pos, Ordering::Release);
         }
     } else if _operation_id == kAudioServerPlugInIOOperationReadInput {
         if !_io_main_buffer.is_null() {
             let output = _io_main_buffer as *mut f32;
-            let mut r_pos = (*driver).read_pos.load(Ordering::Acquire);
-            
+            // Use mInputTime to determine read position
+            let sample_time = cycle_info.mInputTime.mSampleTime as usize;
+            let r_pos = sample_time % buffer_frames;
+
             // Calculate how many frames we can read before wrapping
             let frames_until_wrap = buffer_frames - r_pos;
-            
+
             if frames <= frames_until_wrap {
                 // No wrapping needed
                 let src_ptr = loopback_buffer.as_ptr().add(r_pos * channels);
                 let dst_ptr = output;
                 ptr::copy_nonoverlapping(src_ptr, dst_ptr, frames * channels);
                 
-                r_pos += frames;
-                if r_pos >= buffer_frames { r_pos = 0; }
+                // Destructive Read: Clear the buffer after reading to prevent old data from looping
+                // This is essential for OMNIBUS-style routing where channels might not be overwritten every cycle.
+                ptr::write_bytes(loopback_buffer.as_mut_ptr().add(r_pos * channels), 0, frames * channels);
             } else {
                 // Wrapping needed
                 // 1. Read until end
@@ -943,16 +1081,18 @@ unsafe extern "C" fn do_io_operation(
                 let dst_ptr1 = output;
                 ptr::copy_nonoverlapping(src_ptr1, dst_ptr1, frames_until_wrap * channels);
                 
+                // Clear part 1
+                ptr::write_bytes(loopback_buffer.as_mut_ptr().add(r_pos * channels), 0, frames_until_wrap * channels);
+
                 // 2. Read remainder from start
                 let remainder = frames - frames_until_wrap;
                 let src_ptr2 = loopback_buffer.as_ptr(); // Start of buffer
                 let dst_ptr2 = output.add(frames_until_wrap * channels);
                 ptr::copy_nonoverlapping(src_ptr2, dst_ptr2, remainder * channels);
                 
-                r_pos = remainder;
+                // Clear part 2
+                ptr::write_bytes(loopback_buffer.as_mut_ptr(), 0, remainder * channels);
             }
-            
-            (*driver).read_pos.store(r_pos, Ordering::Release);
         }
     }
     0
@@ -968,13 +1108,13 @@ unsafe extern "C" fn do_io_operation(
 }
 
 // Helper for logging
-fn log_msg(_msg: &str) {
-    // use std::io::Write;
-    // // Use a fixed path in /tmp to ensure we can write to it and find it.
-    // // Ignoring errors as we can't do much if logging fails.
-    // if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/prism.log") {
-    //     let _ = writeln!(file, "{}", msg);
-    // }
+fn log_msg(msg: &str) {
+    use std::io::Write;
+    // Use a fixed path in /tmp to ensure we can write to it and find it.
+    // Ignoring errors as we can't do much if logging fails.
+    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/prism.log") {
+        let _ = writeln!(file, "{}", msg);
+    }
 }
 
 // V-Table storage
@@ -1013,6 +1153,16 @@ pub fn create_driver() -> *mut PrismDriver {
 
             let config = PrismConfig::load();
             let buffer_size = 65536 * config.num_channels as usize; // 65536 frames * channels
+
+            let mut client_slots = Vec::with_capacity(MAX_CLIENTS);
+            for _ in 0..MAX_CLIENTS {
+                client_slots.push(ClientSlot {
+                    client_id: AtomicU32::new(0),
+                    channel_offset: AtomicUsize::new(0),
+                    pid: AtomicI32::new(0),
+                });
+            }
+
             let driver = Box::new(PrismDriver {
                 _vtable: &raw const DRIVER_VTABLE,
                 ref_count: AtomicU32::new(1),
@@ -1028,6 +1178,7 @@ pub fn create_driver() -> *mut PrismDriver {
                 write_pos: AtomicUsize::new(0),
                 _pad2: [0; 64],
                 read_pos: AtomicUsize::new(0),
+                client_slots,
             });
             DRIVER_INSTANCE = Box::into_raw(driver);
         } else {
@@ -1037,4 +1188,13 @@ pub fn create_driver() -> *mut PrismDriver {
         }
         DRIVER_INSTANCE
     }
+}
+
+#[repr(C)]
+#[allow(non_snake_case)]
+struct PrismClientInfo {
+    mClientID: UInt32,
+    mProcessID: pid_t,
+    mIsNativeEndian: Boolean,
+    mBundleID: CFStringRef,
 }
