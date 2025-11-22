@@ -21,11 +21,13 @@ pub struct PrismDriver {
     pub num_time_stamps: AtomicU64,
     pub host_ticks_per_frame: f64,
     pub client_count: AtomicU32,
+    pub phase: f64,
 }
 
 // The singleton instance of our driver
 static mut DRIVER_INSTANCE: *mut PrismDriver = ptr::null_mut();
 
+#[allow(deprecated)]
 fn get_host_ticks_per_second() -> f64 {
     let mut info = libc::mach_timebase_info_data_t { numer: 0, denom: 0 };
     unsafe {
@@ -77,7 +79,7 @@ unsafe extern "C" fn initialize(
     _self: AudioServerPlugInDriverRef,
     host: AudioServerPlugInHostRef,
 ) -> OSStatus {
-    log_msg("Prism: Initialize called");
+    // log_msg("Prism: Initialize called");
     let driver = _self as *mut PrismDriver;
     (*driver).host = Some(host);
     0
@@ -154,6 +156,20 @@ const kAudioDevicePropertyBufferFrameSize: AudioObjectPropertySelector = 0x66736
 const kAudioDevicePropertyBufferFrameSizeRange: AudioObjectPropertySelector = 0x66737A72; // 'fszr'
 #[allow(non_upper_case_globals)]
 const kAudioObjectPropertyControlList: AudioObjectPropertySelector = 0x6374726C; // 'ctrl'
+#[allow(non_upper_case_globals)]
+const kAudioObjectPropertyCustomPropertyInfoList: AudioObjectPropertySelector = 0x63757374; // 'cust'
+#[allow(non_upper_case_globals)]
+const kAudioDevicePropertyStreamsIsSettable: AudioObjectPropertySelector = 0x7369736F; // 'siso'
+#[allow(non_upper_case_globals)]
+const kAudioDevicePropertyClockDomain: AudioObjectPropertySelector = 0x636C6B64; // 'clkd'
+#[allow(non_upper_case_globals)]
+const kAudioDevicePropertyClockSource: AudioObjectPropertySelector = 0x63737263; // 'csrc'
+#[allow(non_upper_case_globals)]
+const kAudioDevicePropertyIsHidden: AudioObjectPropertySelector = 0x6869646E; // 'hidn'
+#[allow(non_upper_case_globals)]
+const kAudioObjectPropertyName: AudioObjectPropertySelector = 0x6C6E616D; // 'lnam'
+#[allow(non_upper_case_globals)]
+const kAudioDevicePropertyRingBufferFrameSize: AudioObjectPropertySelector = 0x72696E67; // 'ring'
 
 #[allow(non_upper_case_globals)]
 unsafe extern "C" fn has_property(
@@ -174,7 +190,8 @@ unsafe extern "C" fn has_property(
                selector == kAudioObjectPropertyOwnedObjects ||
                selector == kAudioPlugInPropertyDeviceList ||
                selector == kAudioPlugInPropertyTranslateUIDToDevice ||
-               selector == kAudioPlugInPropertyResourceBundle {
+               selector == kAudioPlugInPropertyResourceBundle ||
+               selector == kAudioObjectPropertyCustomPropertyInfoList {
                 true
             } else {
                 false
@@ -187,12 +204,15 @@ unsafe extern "C" fn has_property(
                selector == kAudioObjectPropertyManufacturer ||
                selector == kAudioObjectPropertyOwnedObjects ||
                selector == kAudioObjectPropertyControlList ||
+               selector == kAudioObjectPropertyCustomPropertyInfoList ||
                selector == kAudioDevicePropertyStreams ||
+               selector == kAudioDevicePropertyStreamsIsSettable ||
                selector == kAudioDevicePropertyDeviceUID ||
                selector == kAudioDevicePropertyModelUID ||
-               selector == kAudioDevicePropertyTransportType ||
                selector == kAudioDevicePropertyDeviceName ||
+               selector == kAudioObjectPropertyName ||
                selector == kAudioDevicePropertyDeviceIsRunning ||
+               selector == kAudioDevicePropertyIsHidden ||
                selector == kAudioDevicePropertyDeviceCanBeDefaultDevice ||
                selector == kAudioDevicePropertyDeviceCanBeDefaultSystemDevice ||
                selector == kAudioDevicePropertySafetyOffset ||
@@ -202,7 +222,10 @@ unsafe extern "C" fn has_property(
                selector == kAudioDevicePropertyAvailableNominalSampleRates ||
                selector == kAudioDevicePropertyBufferFrameSize ||
                selector == kAudioDevicePropertyBufferFrameSizeRange ||
+               selector == kAudioDevicePropertyRingBufferFrameSize ||
                selector == kAudioDevicePropertyZeroTimeStampPeriod ||
+               selector == kAudioDevicePropertyClockDomain ||
+               selector == kAudioDevicePropertyClockSource ||
                selector == kAudioObjectPropertyScope ||
                selector == kAudioObjectPropertyElement ||
                selector == kAudioDevicePropertyBufferFrameSize {
@@ -216,6 +239,7 @@ unsafe extern "C" fn has_property(
                selector == kAudioObjectPropertyClass ||
                selector == kAudioObjectPropertyOwner ||
                selector == kAudioObjectPropertyControlList ||
+               selector == kAudioObjectPropertyCustomPropertyInfoList ||
                selector == kAudioStreamPropertyDirection ||
                selector == kAudioStreamPropertyTerminalType ||
                selector == kAudioStreamPropertyStartingChannel ||
@@ -226,10 +250,13 @@ unsafe extern "C" fn has_property(
                 false
             }
         },
-        _ => false
+        _ => {
+            log_msg(&format!("Prism: HasProperty called. Object: {}, Selector: {} -> false", object_id, selector));
+            false
+        }
     };
 
-    log_msg(&format!("Prism: HasProperty called. Object: {}, Selector: {} -> {}", object_id, selector, res));
+    // log_msg(&format!("Prism: HasProperty called. Object: {}, Selector: {} -> {}", object_id, selector, res));
     if res { 1 } else { 0 }
 }
 
@@ -257,7 +284,7 @@ unsafe extern "C" fn get_property_data_size(
 ) -> OSStatus {
     let address = *_address;
     let selector = address.mSelector;
-    log_msg(&format!("Prism: GetPropertyDataSize called. Object: {}, Selector: {}", object_id, selector));
+    // log_msg(&format!("Prism: GetPropertyDataSize called. Object: {}, Selector: {}", object_id, selector));
 
     match object_id {
         id if id == kAudioObjectPlugInObject => {
@@ -272,13 +299,18 @@ unsafe extern "C" fn get_property_data_size(
             } else if selector == kAudioPlugInPropertyDeviceList ||
                       selector == kAudioObjectPropertyOwnedObjects {
                 *_out_data_size = std::mem::size_of::<AudioObjectID>() as UInt32;
+            } else if selector == kAudioObjectPropertyCustomPropertyInfoList {
+                *_out_data_size = 0;
             } else {
+                log_msg(&format!("Prism: GetPropertyDataSize called. Object: {}, Selector: {}", object_id, selector));
                 return kAudioHardwareUnknownPropertyError as OSStatus;
             }
         },
         DEVICE_ID => {
-            if selector == kAudioObjectPropertyControlList {
+            if selector == kAudioObjectPropertyControlList || selector == kAudioObjectPropertyCustomPropertyInfoList {
                 *_out_data_size = 0;
+            } else if selector == kAudioDevicePropertyStreamsIsSettable || selector == kAudioDevicePropertyClockDomain || selector == kAudioDevicePropertyClockSource {
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioObjectPropertyBaseClass ||
                selector == kAudioObjectPropertyClass ||
                selector == kAudioObjectPropertyOwner ||
@@ -289,6 +321,7 @@ unsafe extern "C" fn get_property_data_size(
                selector == kAudioDevicePropertySafetyOffset ||
                selector == kAudioDevicePropertyLatency ||
                selector == kAudioDevicePropertyDeviceIsAlive ||
+               selector == kAudioDevicePropertyIsHidden ||
                selector == kAudioDevicePropertyZeroTimeStampPeriod ||
                selector == kAudioObjectPropertyScope ||
                selector == kAudioObjectPropertyElement {
@@ -296,21 +329,35 @@ unsafe extern "C" fn get_property_data_size(
             } else if selector == kAudioObjectPropertyManufacturer ||
                       selector == kAudioDevicePropertyDeviceUID ||
                       selector == kAudioDevicePropertyModelUID ||
-                      selector == kAudioDevicePropertyDeviceName {
+                      selector == kAudioDevicePropertyDeviceName ||
+                      selector == kAudioObjectPropertyName {
                 *_out_data_size = std::mem::size_of::<CFStringRef>() as UInt32;
-            } else if selector == kAudioObjectPropertyOwnedObjects || selector == kAudioDevicePropertyStreams {
+            } else if selector == kAudioObjectPropertyOwnedObjects {
                 *_out_data_size = (2 * std::mem::size_of::<AudioObjectID>()) as UInt32;
+            } else if selector == kAudioDevicePropertyStreams {
+                let scope = address.mScope;
+                let mut count = 0;
+                if scope == kAudioObjectPropertyScopeGlobal || scope == kAudioObjectPropertyScopeInput {
+                    count += 1;
+                }
+                if scope == kAudioObjectPropertyScopeGlobal || scope == kAudioObjectPropertyScopeOutput {
+                    count += 1;
+                }
+                *_out_data_size = (count * std::mem::size_of::<AudioObjectID>()) as UInt32;
             } else if selector == kAudioDevicePropertyNominalSampleRate {
                 *_out_data_size = std::mem::size_of::<Float64>() as UInt32;
             } else if selector == kAudioDevicePropertyAvailableNominalSampleRates ||
                       selector == kAudioDevicePropertyBufferFrameSizeRange {
                 *_out_data_size = std::mem::size_of::<AudioValueRange>() as UInt32;
+            } else if selector == kAudioDevicePropertyRingBufferFrameSize {
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else {
+                log_msg(&format!("Prism: GetPropertyDataSize called. Object: {}, Selector: {}", object_id, selector));
                 return kAudioHardwareUnknownPropertyError as OSStatus;
             }
         },
         INPUT_STREAM_ID | OUTPUT_STREAM_ID => {
-            if selector == kAudioObjectPropertyControlList {
+            if selector == kAudioObjectPropertyControlList || selector == kAudioObjectPropertyCustomPropertyInfoList {
                 *_out_data_size = 0;
             } else if selector == kAudioObjectPropertyBaseClass ||
                selector == kAudioObjectPropertyClass ||
@@ -329,6 +376,7 @@ unsafe extern "C" fn get_property_data_size(
                       selector == kAudioStreamPropertyAvailablePhysicalFormats {
                 *_out_data_size = std::mem::size_of::<AudioStreamRangedDescription>() as UInt32;
             } else {
+                log_msg(&format!("Prism: GetPropertyDataSize called. Object: {}, Selector: {}", object_id, selector));
                 return kAudioHardwareUnknownPropertyError as OSStatus;
             }
         },
@@ -360,7 +408,9 @@ unsafe extern "C" fn get_property_data(
 
     match object_id {
         id if id == kAudioObjectPlugInObject => {
-            if selector == kAudioObjectPropertyBaseClass {
+            if selector == kAudioObjectPropertyCustomPropertyInfoList {
+                *_out_data_size = 0;
+            } else if selector == kAudioObjectPropertyBaseClass {
                 let out = _out_data as *mut AudioClassID;
                 *out = kAudioObjectClassID;
                 *_out_data_size = std::mem::size_of::<AudioClassID>() as UInt32;
@@ -406,6 +456,7 @@ unsafe extern "C" fn get_property_data(
                 *out = device_id;
                 *_out_data_size = std::mem::size_of::<AudioObjectID>() as UInt32;
             } else {
+                log_msg(&format!("Prism: GetPropertyData called. Object: {}, Selector: {}", object_id, selector));
                 return kAudioHardwareUnknownPropertyError as OSStatus;
             }
         },
@@ -436,7 +487,7 @@ unsafe extern "C" fn get_property_data(
                 let out = _out_data as *mut CFStringRef;
                 *out = CFStringCreateWithCString(ptr::null(), "com.petitstrawberry.driver.Prism.Model\0".as_ptr() as *const i8, kCFStringEncodingUTF8);
                 *_out_data_size = std::mem::size_of::<CFStringRef>() as UInt32;
-            } else if selector == kAudioDevicePropertyDeviceName {
+            } else if selector == kAudioDevicePropertyDeviceName || selector == kAudioObjectPropertyName {
                 let out = _out_data as *mut CFStringRef;
                 *out = CFStringCreateWithCString(ptr::null(), "Prism\0".as_ptr() as *const i8, kCFStringEncodingUTF8);
                 *_out_data_size = std::mem::size_of::<CFStringRef>() as UInt32;
@@ -451,6 +502,22 @@ unsafe extern "C" fn get_property_data(
             } else if selector == kAudioDevicePropertyDeviceIsAlive {
                 let out = _out_data as *mut UInt32;
                 *out = 1;
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioDevicePropertyIsHidden {
+                let out = _out_data as *mut UInt32;
+                *out = 0;
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioDevicePropertyStreamsIsSettable {
+                let out = _out_data as *mut UInt32;
+                *out = 0;
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioDevicePropertyClockDomain {
+                let out = _out_data as *mut UInt32;
+                *out = 0;
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioDevicePropertyClockSource {
+                let out = _out_data as *mut UInt32;
+                *out = 0; // Internal clock
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioObjectPropertyScope {
                 let out = _out_data as *mut UInt32;
@@ -486,23 +553,41 @@ unsafe extern "C" fn get_property_data(
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioDevicePropertyZeroTimeStampPeriod {
                 let out = _out_data as *mut UInt32;
-                *out = 10000;
+                *out = 512;
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioDevicePropertyBufferFrameSizeRange {
                 let out = _out_data as *mut AudioValueRange;
                 *out = AudioValueRange { mMinimum: 16.0, mMaximum: 4096.0 };
                 *_out_data_size = std::mem::size_of::<AudioValueRange>() as UInt32;
-            } else if selector == kAudioObjectPropertyOwnedObjects || selector == kAudioDevicePropertyStreams {
+            } else if selector == kAudioDevicePropertyRingBufferFrameSize {
+                let out = _out_data as *mut UInt32;
+                *out = 512; // Same as BufferFrameSize
+                *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
+            } else if selector == kAudioObjectPropertyOwnedObjects {
                 let out = _out_data as *mut AudioObjectID;
                 *out.offset(0) = INPUT_STREAM_ID;
                 *out.offset(1) = OUTPUT_STREAM_ID;
                 *_out_data_size = (2 * std::mem::size_of::<AudioObjectID>()) as UInt32;
+            } else if selector == kAudioDevicePropertyStreams {
+                let scope = address.mScope;
+                let out = _out_data as *mut AudioObjectID;
+                let mut count = 0;
+                if scope == kAudioObjectPropertyScopeGlobal || scope == kAudioObjectPropertyScopeInput {
+                    *out.offset(count) = INPUT_STREAM_ID;
+                    count += 1;
+                }
+                if scope == kAudioObjectPropertyScopeGlobal || scope == kAudioObjectPropertyScopeOutput {
+                    *out.offset(count) = OUTPUT_STREAM_ID;
+                    count += 1;
+                }
+                *_out_data_size = (count as usize * std::mem::size_of::<AudioObjectID>()) as UInt32;
             } else {
+                log_msg(&format!("Prism: GetPropertyData called. Object: {}, Selector: {}", object_id, selector));
                 return kAudioHardwareUnknownPropertyError as OSStatus;
             }
         },
         INPUT_STREAM_ID | OUTPUT_STREAM_ID => {
-            if selector == kAudioObjectPropertyControlList {
+            if selector == kAudioObjectPropertyControlList || selector == kAudioObjectPropertyCustomPropertyInfoList {
                 *_out_data_size = 0;
             } else if selector == kAudioObjectPropertyBaseClass {
                 let out = _out_data as *mut AudioClassID;
@@ -571,6 +656,7 @@ unsafe extern "C" fn get_property_data(
                 };
                 *_out_data_size = std::mem::size_of::<AudioStreamRangedDescription>() as UInt32;
             } else {
+                log_msg(&format!("Prism: GetPropertyData called. Object: {}, Selector: {}", object_id, selector));
                 return kAudioHardwareUnknownPropertyError as OSStatus;
             }
         },
@@ -598,7 +684,7 @@ unsafe extern "C" fn start_io(
     _device_id: AudioObjectID,
     _client_id: UInt32,
 ) -> OSStatus {
-    log_msg("Prism: StartIO called");
+    // log_msg("Prism: StartIO called");
     let driver = _self as *mut PrismDriver;
 
     let prev_count = (*driver).client_count.fetch_add(1, Ordering::SeqCst);
@@ -627,7 +713,7 @@ unsafe extern "C" fn stop_io(
     _device_id: AudioObjectID,
     _client_id: UInt32,
 ) -> OSStatus {
-    log_msg("Prism: StopIO called");
+    // log_msg("Prism: StopIO called");
     let driver = _self as *mut PrismDriver;
 
     let prev_count = (*driver).client_count.fetch_sub(1, Ordering::SeqCst);
@@ -668,7 +754,7 @@ unsafe extern "C" fn get_zero_timestamp(
     }
 
     let current_host_time = libc::mach_absolute_time();
-    let period_frames = 10000.0; // kZeroTimeStampPeriod
+    let period_frames = 512.0; // kZeroTimeStampPeriod
     let host_ticks_per_period = (*driver).host_ticks_per_frame * period_frames;
 
     // Calculate the next zero crossing based on anchor time
@@ -723,6 +809,28 @@ unsafe extern "C" fn do_io_operation(
     _io_main_buffer: *mut c_void,
     _io_secondary_buffer: *mut c_void,
 ) -> OSStatus {
+    let driver = _self as *mut PrismDriver;
+
+    if _operation_id == kAudioServerPlugInIOOperationReadInput {
+        let buffer = _io_main_buffer as *mut f32;
+        let frames = _io_buffer_frame_size as usize;
+        let channels = 2;
+        let freq = 440.0;
+        let sample_rate = 48000.0;
+        let phase_inc = 2.0 * std::f64::consts::PI * freq / sample_rate;
+
+        for i in 0..frames {
+            let sample = ((*driver).phase.sin() * 0.2) as f32;
+            (*driver).phase += phase_inc;
+            if (*driver).phase > 2.0 * std::f64::consts::PI {
+                (*driver).phase -= 2.0 * std::f64::consts::PI;
+            }
+
+            for c in 0..channels {
+                *buffer.add(i * channels + c) = sample;
+            }
+        }
+    }
     0
 }
 
@@ -738,13 +846,13 @@ unsafe extern "C" fn end_io_operation(
 }
 
 // Helper for logging
-fn log_msg(msg: &str) {
-    use std::io::Write;
-    // Use a fixed path in /tmp to ensure we can write to it and find it.
-    // Ignoring errors as we can't do much if logging fails.
-    if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/prism.log") {
-        let _ = writeln!(file, "{}", msg);
-    }
+fn log_msg(_msg: &str) {
+    // use std::io::Write;
+    // // Use a fixed path in /tmp to ensure we can write to it and find it.
+    // // Ignoring errors as we can't do much if logging fails.
+    // if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/prism.log") {
+    //     let _ = writeln!(file, "{}", msg);
+    // }
 }
 
 // V-Table storage
@@ -789,6 +897,7 @@ pub fn create_driver() -> *mut PrismDriver {
                 num_time_stamps: AtomicU64::new(0),
                 host_ticks_per_frame,
                 client_count: AtomicU32::new(0),
+                phase: 0.0,
             });
             DRIVER_INSTANCE = Box::into_raw(driver);
         } else {
