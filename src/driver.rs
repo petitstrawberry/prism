@@ -10,6 +10,7 @@ pub struct PrismConfig {
     pub safety_offset: u32,
     pub ring_buffer_frame_size: u32,
     pub zero_timestamp_period: u32,
+    pub num_channels: u32,
 }
 
 impl PrismConfig {
@@ -19,6 +20,7 @@ impl PrismConfig {
             safety_offset: 256,
             ring_buffer_frame_size: 1024,
             zero_timestamp_period: 1024,
+            num_channels: 16, // Default to 16 channels for routing
         }
     }
 
@@ -41,6 +43,7 @@ impl PrismConfig {
                                 "safety_offset" => config.safety_offset = val,
                                 "ring_buffer_frame_size" => config.ring_buffer_frame_size = val,
                                 "zero_timestamp_period" => config.zero_timestamp_period = val,
+                                "num_channels" => config.num_channels = val,
                                 _ => {}
                             }
                         }
@@ -693,10 +696,10 @@ unsafe extern "C" fn get_property_data(
                     mSampleRate: 48000.0,
                     mFormatID: kAudioFormatLinearPCM,
                     mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-                    mBytesPerPacket: 8,
+                    mBytesPerPacket: 4 * (*driver).config.num_channels, // 4 bytes per float * channels
                     mFramesPerPacket: 1,
-                    mBytesPerFrame: 8,
-                    mChannelsPerFrame: 2,
+                    mBytesPerFrame: 4 * (*driver).config.num_channels,
+                    mChannelsPerFrame: (*driver).config.num_channels,
                     mBitsPerChannel: 32,
                     mReserved: 0,
                 };
@@ -710,10 +713,10 @@ unsafe extern "C" fn get_property_data(
                         mSampleRate: 48000.0,
                         mFormatID: kAudioFormatLinearPCM,
                         mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-                        mBytesPerPacket: 8,
+                        mBytesPerPacket: 4 * (*driver).config.num_channels,
                         mFramesPerPacket: 1,
-                        mBytesPerFrame: 8,
-                        mChannelsPerFrame: 2,
+                        mBytesPerFrame: 4 * (*driver).config.num_channels,
+                        mChannelsPerFrame: (*driver).config.num_channels,
                         mBitsPerChannel: 32,
                         mReserved: 0,
                     },
@@ -879,7 +882,7 @@ unsafe extern "C" fn do_io_operation(
     let driver = _self as *mut PrismDriver;
     let loopback_buffer = &mut (*driver).loopback_buffer;
     let frames = _io_buffer_frame_size as usize;
-    let channels = 2;
+    let channels = (*driver).config.num_channels as usize;
     let buffer_len = loopback_buffer.len(); // Total samples in buffer
     let buffer_frames = buffer_len / channels; // Total frames in buffer
 
@@ -887,16 +890,16 @@ unsafe extern "C" fn do_io_operation(
         if !_io_main_buffer.is_null() {
             let input = _io_main_buffer as *const f32;
             let mut w_pos = (*driver).write_pos.load(Ordering::Acquire);
-
+            
             // Calculate how many frames we can write before wrapping
             let frames_until_wrap = buffer_frames - w_pos;
-
+            
             if frames <= frames_until_wrap {
                 // No wrapping needed
                 let src_ptr = input;
                 let dst_ptr = loopback_buffer.as_mut_ptr().add(w_pos * channels);
                 ptr::copy_nonoverlapping(src_ptr, dst_ptr, frames * channels);
-
+                
                 w_pos += frames;
                 if w_pos >= buffer_frames { w_pos = 0; }
             } else {
@@ -905,32 +908,32 @@ unsafe extern "C" fn do_io_operation(
                 let src_ptr1 = input;
                 let dst_ptr1 = loopback_buffer.as_mut_ptr().add(w_pos * channels);
                 ptr::copy_nonoverlapping(src_ptr1, dst_ptr1, frames_until_wrap * channels);
-
+                
                 // 2. Write remainder from start
                 let remainder = frames - frames_until_wrap;
                 let src_ptr2 = input.add(frames_until_wrap * channels);
                 let dst_ptr2 = loopback_buffer.as_mut_ptr(); // Start of buffer
                 ptr::copy_nonoverlapping(src_ptr2, dst_ptr2, remainder * channels);
-
+                
                 w_pos = remainder;
             }
-
+            
             (*driver).write_pos.store(w_pos, Ordering::Release);
         }
     } else if _operation_id == kAudioServerPlugInIOOperationReadInput {
         if !_io_main_buffer.is_null() {
             let output = _io_main_buffer as *mut f32;
             let mut r_pos = (*driver).read_pos.load(Ordering::Acquire);
-
+            
             // Calculate how many frames we can read before wrapping
             let frames_until_wrap = buffer_frames - r_pos;
-
+            
             if frames <= frames_until_wrap {
                 // No wrapping needed
                 let src_ptr = loopback_buffer.as_ptr().add(r_pos * channels);
                 let dst_ptr = output;
                 ptr::copy_nonoverlapping(src_ptr, dst_ptr, frames * channels);
-
+                
                 r_pos += frames;
                 if r_pos >= buffer_frames { r_pos = 0; }
             } else {
@@ -939,23 +942,21 @@ unsafe extern "C" fn do_io_operation(
                 let src_ptr1 = loopback_buffer.as_ptr().add(r_pos * channels);
                 let dst_ptr1 = output;
                 ptr::copy_nonoverlapping(src_ptr1, dst_ptr1, frames_until_wrap * channels);
-
+                
                 // 2. Read remainder from start
                 let remainder = frames - frames_until_wrap;
                 let src_ptr2 = loopback_buffer.as_ptr(); // Start of buffer
                 let dst_ptr2 = output.add(frames_until_wrap * channels);
                 ptr::copy_nonoverlapping(src_ptr2, dst_ptr2, remainder * channels);
-
+                
                 r_pos = remainder;
             }
-
+            
             (*driver).read_pos.store(r_pos, Ordering::Release);
         }
     }
     0
-}
-
-unsafe extern "C" fn end_io_operation(
+}unsafe extern "C" fn end_io_operation(
     _self: AudioServerPlugInDriverRef,
     _device_id: AudioObjectID,
     _client_id: UInt32,
@@ -1011,7 +1012,7 @@ pub fn create_driver() -> *mut PrismDriver {
             let host_ticks_per_frame = host_ticks_per_second / sample_rate;
 
             let config = PrismConfig::load();
-            let buffer_size = 65536 * 2; // 65536 frames, 2 channels
+            let buffer_size = 65536 * config.num_channels as usize; // 65536 frames * channels
             let driver = Box::new(PrismDriver {
                 _vtable: &raw const DRIVER_VTABLE,
                 ref_count: AtomicU32::new(1),

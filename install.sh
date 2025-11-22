@@ -35,6 +35,7 @@ buffer_frame_size=1024
 safety_offset=256
 ring_buffer_frame_size=1024
 zero_timestamp_period=1024
+num_channels=16
 EOF
     sudo mv "$TMP_CONFIG" "$CONFIG_FILE"
     sudo chmod 666 "$CONFIG_FILE" # Allow everyone to edit
