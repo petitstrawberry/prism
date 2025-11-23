@@ -776,6 +776,10 @@ unsafe extern "C" fn get_property_data(
                      // mPropertyDataType/mQualifierDataType は CoreAudio の定数を使う
                      // BGM と同様に、クライアントがカスタムプロパティを発見しやすいよう
                      // CFPropertyList を使用して宣伝する（多くのクライアントは 'plst' を期待する）
+                     // Advertise CFPropertyList so clients (and debug tools) enumerate
+                     // this property as a plist. The runtime SetPropertyData handler
+                     // will accept either a raw PrismRoutingUpdate struct or a
+                     // CFDataRef containing the binary struct.
                      (*out).mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
                      (*out).mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
                  }
