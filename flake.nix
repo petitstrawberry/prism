@@ -1,5 +1,5 @@
 {
-  description = "A Nix flake for a development shell for prism";
+  description = "A Nix flake for prism development and packaging";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
@@ -28,8 +28,14 @@
                 rustc = toolchain;
               };
 
-              prismDriver = rustPlatform.buildRustPackage rec {
-                pname = "prism-driver";
+              metaCommon = with pkgs.lib; {
+                homepage = "https://github.com/petitstrawberry/prism";
+                license = licenses.mit;
+                platforms = platforms.darwin;
+              };
+
+              prismArtifacts = rustPlatform.buildRustPackage rec {
+                pname = "prism";
                 version = "0.1.0";
                 src = ./.;
 
@@ -37,12 +43,67 @@
 
                 RUSTFLAGS = "-Zunstable-options";
 
+                meta = metaCommon // {
+                  description = "Prism CoreAudio components (library and binaries)";
+                };
+              };
+
+              mkBinaryPackage = { pname, binary, description }:
+                pkgs.stdenv.mkDerivation {
+                  inherit pname;
+                  version = prismArtifacts.version;
+                  dontUnpack = true;
+                  dontBuild = true;
+
+                  installPhase = ''
+                    set -e
+                    set -o pipefail
+                    mkdir -p "$out/bin"
+                    cp ${prismArtifacts}/bin/${binary} "$out/bin/${binary}"
+
+                    if [ -d ${prismArtifacts}/lib ]; then
+                      mkdir -p "$out/lib"
+                      cp -R ${prismArtifacts}/lib/. "$out/lib/"
+                    fi
+
+                    if [ -d ${prismArtifacts}/share ]; then
+                      mkdir -p "$out/share"
+                      cp -R ${prismArtifacts}/share/. "$out/share/"
+                    fi
+                  '';
+
+                  meta = metaCommon // {
+                    inherit description;
+                    mainProgram = binary;
+                  };
+                };
+
+              prismCli = mkBinaryPackage {
+                pname = "prism";
+                binary = "prism";
+                description = "Prism command-line utilities";
+              };
+
+              prismDaemon = mkBinaryPackage {
+                pname = "prismd";
+                binary = "prismd";
+                description = "Prism audio driver daemon";
+              };
+
+              prismDriver = pkgs.stdenv.mkDerivation {
+                pname = "prism-driver";
+                version = prismArtifacts.version;
+                dontUnpack = true;
+
                 nativeBuildInputs = with pkgs; [ darwin.cctools ];
-                postInstall = ''
-                  bundle=$out/Prism.driver
+
+                installPhase = ''
+                  set -e
+                  set -o pipefail
+                  bundle="$out/Prism.driver"
                   mkdir -p "$bundle/Contents/MacOS"
                   cp ${./driver_bundle/Info.plist} "$bundle/Contents/Info.plist"
-                  cp "$out/lib/libprism.dylib" "$bundle/Contents/MacOS/Prism"
+                  cp ${prismArtifacts}/lib/libprism.dylib "$bundle/Contents/MacOS/Prism"
                   chmod +x "$bundle/Contents/MacOS/Prism"
 
                   iconv_path=$(otool -L "$bundle/Contents/MacOS/Prism" | awk '/libiconv/{print $1; exit}')
@@ -54,6 +115,10 @@
                     /usr/bin/codesign --force --deep --sign - "$bundle"
                   fi
                 '';
+
+                meta = metaCommon // {
+                  description = "Prism CoreAudio HAL driver bundle";
+                };
               };
 
               installScript = pkgs.writeShellApplication {
@@ -78,17 +143,36 @@
 
                   echo "Installation complete. Please reboot to activate the driver."
                 '';
+
+                meta = metaCommon // {
+                  description = "Install the Prism HAL driver into /Library/Audio/Plug-Ins/HAL";
+                  mainProgram = "install-prism-driver";
+                };
               };
             in
             {
               packages = {
                 default = prismDriver;
                 prism-driver = prismDriver;
+                prism = prismCli;
+                prismd = prismDaemon;
               };
 
-              apps.install = {
-                type = "app";
-                program = "${installScript}/bin/install-prism-driver";
+              apps = {
+                install = {
+                  type = "app";
+                  program = "${installScript}/bin/install-prism-driver";
+                };
+
+                prism = {
+                  type = "app";
+                  program = "${prismCli}/bin/prism";
+                };
+
+                prismd = {
+                  type = "app";
+                  program = "${prismDaemon}/bin/prismd";
+                };
               };
             }
           else {
@@ -97,7 +181,6 @@
           };
       in
       darwinOutputs // {
-
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
             rustup
@@ -114,7 +197,7 @@
             # Default to stable if no toolchain file found or parsing fails.
             channel=stable
             if [ -f rust-toolchain.toml ]; then
-              channel=$(awk -F\" '/channel/ {print $2; exit}' rust-toolchain.toml || echo stable)
+              channel=$(awk -F" '/channel/ {print $2; exit}' rust-toolchain.toml || echo stable)
             fi
 
             if command -v rustup >/dev/null 2>&1; then
