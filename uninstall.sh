@@ -10,7 +10,4 @@ else
     echo "$DRIVER_PATH not found."
 fi
 
-echo "Restarting coreaudiod..."
-sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
-
-echo "Uninstallation complete."
+echo "Please reboot your system to complete the uninstallation of the Prism driver."

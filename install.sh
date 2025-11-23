@@ -22,29 +22,4 @@ if [ ! -d "$CONFIG_DIR" ]; then
     sudo chmod 777 "$CONFIG_DIR" # Allow everyone to write to the dir for now
 fi
 
-if [ ! -f "$CONFIG_FILE" ]; then
-    echo "Creating default config at $CONFIG_FILE"
-    # Create a temporary file first to avoid permission issues with redirection
-    TMP_CONFIG=$(mktemp)
-    cat <<EOF > "$TMP_CONFIG"
-# Prism Driver Configuration
-# Restart coreaudiod after changing these values:
-# sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
-
-buffer_frame_size=1024
-safety_offset=256
-ring_buffer_frame_size=1024
-zero_timestamp_period=1024
-num_channels=16
-EOF
-    sudo mv "$TMP_CONFIG" "$CONFIG_FILE"
-    sudo chmod 666 "$CONFIG_FILE" # Allow everyone to edit
-else
-    echo "Config file already exists at $CONFIG_FILE"
-fi
-
-echo "Restarting coreaudiod..."
-sudo launchctl kickstart -k system/com.apple.audio.coreaudiod
-
-echo "Installation complete. Check logs with:"
-echo "log stream --predicate 'process == \"coreaudiod\"' | grep Prism"
+echo "Please reboot your system to complete the installation of the Prism driver."
