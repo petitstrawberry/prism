@@ -198,7 +198,7 @@ pub fn read_custom_property_info(
     }
 
     let entry_size = mem::size_of::<AudioServerPlugInCustomPropertyInfoRaw>();
-    if read_size as usize % entry_size != 0 {
+    if !(read_size as usize).is_multiple_of(entry_size) {
         return Err("Unexpected 'cust' data size".to_string());
     }
 

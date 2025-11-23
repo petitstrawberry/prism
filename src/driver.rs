@@ -272,7 +272,7 @@ unsafe extern "C" fn add_device_client(
         ));
 
         slot.channel_offset.store(channel_offset, Ordering::SeqCst);
-        slot.pid.store(pid as i32, Ordering::SeqCst);
+        slot.pid.store(pid, Ordering::SeqCst);
         slot.client_id.store(client_id, Ordering::Release);
 
         notify_device_property_changed(driver, kAudioPrismPropertyClientList);
@@ -1372,11 +1372,7 @@ unsafe extern "C" fn get_zero_timestamp(
 
     // Calculate the next zero crossing based on anchor time
     // We want the smallest N such that anchor + N * period > current_time
-    let elapsed_ticks = if current_host_time > anchor {
-        current_host_time - anchor
-    } else {
-        0
-    };
+    let elapsed_ticks = current_host_time.saturating_sub(anchor);
 
     let num_periods = (elapsed_ticks as f64 / host_ticks_per_period).floor() as u64;
     let next_period = num_periods + 1;
@@ -1461,7 +1457,7 @@ unsafe extern "C" fn do_io_operation(
             if frames <= frames_until_wrap {
                 // No wrapping needed
                 for i in 0..frames {
-                    let in_l = *input.add(i * input_channels + 0);
+                    let in_l = *input.add((i * input_channels));
                     let in_r = *input.add(i * input_channels + 1);
 
                     let dst_idx = (w_pos + i) * channels + channel_offset;
@@ -1473,7 +1469,7 @@ unsafe extern "C" fn do_io_operation(
             } else {
                 // Wrapping needed
                 for i in 0..frames_until_wrap {
-                    let in_l = *input.add(i * input_channels + 0);
+                    let in_l = *input.add((i * input_channels));
                     let in_r = *input.add(i * input_channels + 1);
                     let dst_idx = (w_pos + i) * channels + channel_offset;
                     if dst_idx + 1 < buffer_len {
@@ -1485,7 +1481,7 @@ unsafe extern "C" fn do_io_operation(
                 let remainder = frames - frames_until_wrap;
                 for i in 0..remainder {
                     let src_idx = frames_until_wrap + i;
-                    let in_l = *input.add(src_idx * input_channels + 0);
+                    let in_l = *input.add((src_idx * input_channels));
                     let in_r = *input.add(src_idx * input_channels + 1);
                     let dst_idx = i * channels + channel_offset;
                     if dst_idx + 1 < buffer_len {
@@ -1495,8 +1491,8 @@ unsafe extern "C" fn do_io_operation(
                 }
             }
         }
-    } else if _operation_id == kAudioServerPlugInIOOperationReadInput {
-        if !_io_main_buffer.is_null() {
+    } else if _operation_id == kAudioServerPlugInIOOperationReadInput
+        && !_io_main_buffer.is_null() {
             let output = _io_main_buffer as *mut f32;
             // Use mInputTime to determine read position
             let sample_time = cycle_info.mInputTime.mSampleTime as usize;
@@ -1542,7 +1538,6 @@ unsafe extern "C" fn do_io_operation(
                 ptr::write_bytes(loopback_buffer.as_mut_ptr(), 0, remainder * channels);
             }
         }
-    }
     0
 }
 unsafe extern "C" fn end_io_operation(
