@@ -23,8 +23,6 @@ cargo install --path .
 
 ## Usage
 
-Control is performed via the daemon (`prismd`). The rest of this README (build/install) remains applicable, but runtime routing is managed through `prismd` commands.
-
 Start the daemon
 - Run `prismd` in the background to open the interactive REPL:
 
