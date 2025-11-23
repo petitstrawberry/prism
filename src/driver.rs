@@ -799,7 +799,7 @@ unsafe extern "C" fn get_property_data(
                     let out = _out_data as *mut CFStringRef;
                     *out = CFStringCreateWithCString(
                         ptr::null(),
-                        "com.petitstrawberry.driver.Prism\0".as_ptr() as *const i8,
+                        "dev.ichigo.driver.Prism\0".as_ptr() as *const i8,
                         kCFStringEncodingUTF8,
                     );
                     *_out_data_size = std::mem::size_of::<CFStringRef>() as UInt32;
@@ -830,7 +830,7 @@ unsafe extern "C" fn get_property_data(
                         let uid = *(_qualifier_data as *const CFStringRef);
                         let my_uid = CFStringCreateWithCString(
                             ptr::null(),
-                            "com.petitstrawberry.driver.Prism.Device\0".as_ptr() as *const i8,
+                            "dev.ichigo.driver.Prism.Device\0".as_ptr() as *const i8,
                             kCFStringEncodingUTF8,
                         );
                         if CFStringCompare(uid, my_uid, 0) == 0 {
@@ -942,7 +942,7 @@ unsafe extern "C" fn get_property_data(
                     let out = _out_data as *mut CFStringRef;
                     *out = CFStringCreateWithCString(
                         ptr::null(),
-                        "com.petitstrawberry.driver.Prism.Device\0".as_ptr() as *const i8,
+                        "dev.ichigo.driver.Prism.Device\0".as_ptr() as *const i8,
                         kCFStringEncodingUTF8,
                     );
                     *_out_data_size = std::mem::size_of::<CFStringRef>() as UInt32;
@@ -951,7 +951,7 @@ unsafe extern "C" fn get_property_data(
                     let out = _out_data as *mut CFStringRef;
                     *out = CFStringCreateWithCString(
                         ptr::null(),
-                        "com.petitstrawberry.driver.Prism.Model\0".as_ptr() as *const i8,
+                        "dev.ichigo.driver.Prism.Model\0".as_ptr() as *const i8,
                         kCFStringEncodingUTF8,
                     );
                     *_out_data_size = std::mem::size_of::<CFStringRef>() as UInt32;

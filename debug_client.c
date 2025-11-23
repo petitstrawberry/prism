@@ -16,7 +16,7 @@
 #endif
 
 // Default UID (for Prism)
-#define DEFAULT_DEVICE_UID "com.petitstrawberry.driver.Prism.Device"
+#define DEFAULT_DEVICE_UID "dev.ichigo.driver.Prism.Device"
 
 // -----------------------------
 

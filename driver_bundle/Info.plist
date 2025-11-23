@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>Prism</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.petitstrawberry.driver.Prism</string>
+	<string>dev.ichigo.driver.Prism</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>

@@ -269,7 +269,7 @@ pub fn find_prism_device() -> Result<AudioObjectID, String> {
 
     for device_id in device_ids {
         if let Some(uid) = get_device_uid(device_id) {
-            if uid == "com.petitstrawberry.driver.Prism.Device" {
+            if uid == "dev.ichigo.driver.Prism.Device" {
                 return Ok(device_id);
             }
         }
