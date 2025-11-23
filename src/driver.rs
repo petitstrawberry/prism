@@ -1035,134 +1035,71 @@ unsafe extern "C" fn set_property_data(
     let driver = _self as *mut PrismDriver;
     let address = *_address;
     let selector = address.mSelector;
-
     log_msg(&format!("Prism: SetPropertyData called. Object: {}, Selector: {}", _object_id, selector));
 
     if selector == kAudioPrismPropertyRoutingTable {
-        if _in_data_size != std::mem::size_of::<PrismRoutingUpdate>() as UInt32 {
+        // CFData-only: expect a CFDataRef containing the little-endian PrismRoutingUpdate bytes
+        extern "C" {
+            fn CFDataGetLength(theData: CFDataRef) -> isize;
+            fn CFDataGetBytePtr(theData: CFDataRef) -> *const u8;
+        }
+
+        let expected_struct_size = std::mem::size_of::<PrismRoutingUpdate>();
+        let cfdata_ref_size = std::mem::size_of::<CFDataRef>();
+
+        if _in_data_size != cfdata_ref_size as UInt32 {
+            log_msg(&format!("Prism: SetPropertyData ROUT rejected: expected CFDataRef size={}, got={}", cfdata_ref_size, _in_data_size));
             return kAudioHardwareBadPropertySizeError as OSStatus;
         }
-        let update = *(_in_data as *const PrismRoutingUpdate);
-        let pid = update.pid;
-        let offset = update.channel_offset;
 
-        log_msg(&format!("Prism: SetPropertyData ROUT: PID={}, Offset={}", pid, offset));
+        let data_ref = *(_in_data as *const CFDataRef);
+        if data_ref.is_null() {
+            return kAudioHardwareIllegalOperationError as OSStatus;
+        }
+
+        let len = unsafe { CFDataGetLength(data_ref) } as usize;
+        let ptr = unsafe { CFDataGetBytePtr(data_ref) };
+        if ptr.is_null() || len < expected_struct_size {
+            log_msg(&format!("Prism: SetPropertyData ROUT rejected: CFData length {} too small", len));
+            return kAudioHardwareBadPropertySizeError as OSStatus;
+        }
+
+        // Copy into local buffer and parse little-endian fields
+        let mut buf = [0u8; std::mem::size_of::<PrismRoutingUpdate>()];
+        unsafe { ptr::copy_nonoverlapping(ptr, buf.as_mut_ptr(), buf.len()); }
+        let pid = i32::from_le_bytes([buf[0], buf[1], buf[2], buf[3]]);
+        let offset = u32::from_le_bytes([buf[4], buf[5], buf[6], buf[7]]);
+
+        log_msg(&format!("Prism: SetPropertyData ROUT (CFData) PID={}, Offset={}", pid, offset));
+
+        let driver_ref = &*driver;
+        let slots = &driver_ref.client_slots;
+
+        // pid == -1 => broadcast to all clients
+        if pid == -1 {
+            for j in 0..MAX_CLIENTS {
+                let slot = &slots[j];
+                slot.channel_offset.store(offset as usize, Ordering::Release);
+            }
+            log_msg(&format!("Prism: Routing Update ROUT Broadcast. Offset={}", offset));
+            return 0;
+        }
 
         if pid != 0 {
-            // Apply update
             let mut found = false;
-            let driver_ref = &*driver;
-            let slots = &driver_ref.client_slots;
             for j in 0..MAX_CLIENTS {
-                    let slot = &slots[j];
-                    if slot.pid.load(Ordering::Acquire) == pid {
-                        slot.channel_offset.store(offset as usize, Ordering::Release);
-                        log_msg(&format!("Prism: Routing Update via ROUT. PID={}, Offset={}", pid, offset));
-                        found = true;
-                    }
+                let slot = &slots[j];
+                if slot.pid.load(Ordering::Acquire) == pid {
+                    slot.channel_offset.store(offset as usize, Ordering::Release);
+                    log_msg(&format!("Prism: Routing Update via ROUT. PID={}, Offset={}", pid, offset));
+                    found = true;
+                }
             }
             if !found {
                 log_msg(&format!("Prism: Routing Update via ROUT Failed. PID={} not found", pid));
             }
         }
-        return 0;
-    } else if selector == kAudioDevicePropertyDeviceName || selector == kAudioObjectPropertyName {
-        if _in_data_size != std::mem::size_of::<CFStringRef>() as UInt32 {
-            return kAudioHardwareBadPropertySizeError as OSStatus;
-        }
-        let name_ref = *(_in_data as *const CFStringRef);
 
-        // Convert CFString to Rust String
-        let mut buf = [0u8; 256];
-        let success = CFStringGetCString(name_ref, buf.as_mut_ptr() as *mut i8, 256, kCFStringEncodingUTF8);
-
-        if success != 0 {
-            let c_str = std::ffi::CStr::from_ptr(buf.as_ptr() as *const i8);
-            if let Ok(s) = c_str.to_str() {
-                log_msg(&format!("Prism: SetPropertyData DeviceName: {}", s));
-
-                // Parse "PID:1234,Offset:2"
-                // Simple parsing
-                if s.starts_with("PID:") {
-                    let parts: Vec<&str> = s.split(',').collect();
-                    let mut pid = 0;
-                    let mut offset = 0;
-
-                    for part in parts {
-                        if part.starts_with("PID:") {
-                            if let Ok(p) = part[4..].parse::<i32>() {
-                                pid = p;
-                            }
-                        } else if part.starts_with("Offset:") {
-                            if let Ok(o) = part[7..].parse::<u32>() {
-                                offset = o;
-                            }
-                        }
-                    }
-
-                    if pid != 0 {
-                        // Apply update
-                        let mut found = false;
-                        let driver_ref = &*driver;
-                        let slots = &driver_ref.client_slots;
-                        for j in 0..MAX_CLIENTS {
-                             let slot = &slots[j];
-                             if slot.pid.load(Ordering::Acquire) == pid {
-                                 slot.channel_offset.store(offset as usize, Ordering::Release);
-                                 log_msg(&format!("Prism: Routing Update via Name. PID={}, Offset={}", pid, offset));
-                                 found = true;
-                             }
-                        }
-                        if !found {
-                            log_msg(&format!("Prism: Routing Update via Name Failed. PID={} not found", pid));
-                        }
-                    }
-                }
-            }
-        }
-        return 0;
-    } else if selector == kAudioDevicePropertyDataSource || selector == kAudioDevicePropertyNominalSampleRate {
-        // Trigger Command Read
-        log_msg("Prism: DataSource/SampleRate set. Reading command from /tmp/prism_command.txt");
-        if let Ok(content) = std::fs::read_to_string("/tmp/prism_command.txt") {
-             log_msg(&format!("Prism: Command content: {}", content));
-             // Parse "PID:1234,Offset:2"
-             if content.starts_with("PID:") {
-                    let parts: Vec<&str> = content.split(',').collect();
-                    let mut pid = 0;
-                    let mut offset = 0;
-
-                    for part in parts {
-                        if part.starts_with("PID:") {
-                            if let Ok(p) = part[4..].trim().parse::<i32>() {
-                                pid = p;
-                            }
-                        } else if part.starts_with("Offset:") {
-                            if let Ok(o) = part[7..].trim().parse::<u32>() {
-                                offset = o;
-                            }
-                        }
-                    }
-
-                    if pid != 0 {
-                        // Apply update
-                        let mut found = false;
-                        let driver_ref = &*driver;
-                        let slots = &driver_ref.client_slots;
-                        for j in 0..MAX_CLIENTS {
-                             let slot = &slots[j];
-                             if slot.pid.load(Ordering::Acquire) == pid {
-                                 slot.channel_offset.store(offset as usize, Ordering::Release);
-                                 log_msg(&format!("Prism: Routing Update via File. PID={}, Offset={}", pid, offset));
-                                 found = true;
-                             }
-                        }
-                        if !found {
-                            log_msg(&format!("Prism: Routing Update via File Failed. PID={} not found", pid));
-                        }
-                    }
-             }
-        }
         return 0;
     }
 
