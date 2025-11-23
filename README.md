@@ -24,30 +24,30 @@ cargo install --path .
 ## Usage
 
 Start the daemon
-- Run `prismd` in the background to open the interactive REPL:
+- Run `prismd` in the background. It stays resident and listens for client list changes from the driver:
 
 ```bash
 prismd &
 ```
 
-One‑shot CLI (scripting)
-- Useful when you want to script a single routing change without entering the REPL:
+Use the CLI
+- The `prism` command sends requests to `prismd`, which performs all driver operations:
 
 ```bash
-# Send a routing update: prismd set <PID> <OFFSET>
-prismd set 12345 2
+# Show active Prism clients
+prism clients
+
+# Send a routing update: prism set <PID> <OFFSET>
+prism set 12345 2
+
+# Explore interactively
+prism repl
 ```
 
-Interactive REPL
-- If you run `prismd` with no arguments it opens a small REPL. Key commands:
-- `help` — show available commands
-- `set <PID> <OFFSET>` — send a routing update for PID
-- `list` — list the driver's custom properties (to inspect available selectors)
-- `clients` — print the driver's current client snapshot (PID, client id, offset)
-- `exit` / `quit` — quit the REPL
+The interactive REPL mirrors the standalone commands (`set`, `list`, `clients`, `help`, `exit`). Ensure `prismd` is running before invoking the CLI.
 
 How routing updates work
-- `prismd` sends a custom CoreAudio property (`'rout'`) containing a binary struct `{ pid: i32, channel_offset: u32 }` to the driver. The driver uses that information to map a source PID to a channel offset.
+- The CLI sends a custom CoreAudio property (`'rout'`) containing a binary struct `{ pid: i32, channel_offset: u32 }`. The driver uses that information to map a source PID to a channel offset.
 
 ## Uninstall
 

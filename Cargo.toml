@@ -10,6 +10,10 @@ crate-type = ["cdylib"]
 name = "prismd"
 path = "src/bin/prismd.rs"
 
+[[bin]]
+name = "prism"
+path = "src/bin/prism.rs"
+
 [dependencies]
 coreaudio-sys = "0.2"
 libc = "0.2"
