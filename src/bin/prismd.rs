@@ -1,14 +1,186 @@
 use coreaudio_sys::*;
-use std::ptr;
-use std::mem;
-use std::env;
-use std::io::{self, BufRead, Write};
-use core_foundation::string::CFString;
 use core_foundation::base::TCFType;
-use core_foundation::data::CFData;
+use core_foundation::data::{CFData, CFDataRef};
+use core_foundation::string::CFString;
+use plist::Value;
+use std::env;
+use std::ffi::c_void;
+use std::io::{self, BufRead, Cursor, Write};
+use std::mem;
+use std::ptr;
+use std::sync::Mutex;
 
 // Constants
 const K_AUDIO_PRISM_PROPERTY_ROUTING_TABLE: AudioObjectPropertySelector = 0x726F7574; // 'rout'
+const K_AUDIO_PRISM_PROPERTY_CLIENT_LIST: AudioObjectPropertySelector = 0x636C6E74; // 'clnt'
+
+#[derive(Clone, Debug, Default)]
+struct ClientEntry {
+    pid: i32,
+    client_id: u32,
+    channel_offset: u32,
+}
+
+static CLIENT_LIST: Mutex<Vec<ClientEntry>> = Mutex::new(Vec::new());
+
+struct ClientListContext {
+    device_id: AudioObjectID,
+}
+
+unsafe extern "C" fn client_list_listener(
+    _: AudioObjectID,
+    _: UInt32,
+    _: *const AudioObjectPropertyAddress,
+    client_data: *mut c_void,
+) -> OSStatus {
+    if client_data.is_null() {
+        return 0;
+    }
+
+    let context = &*(client_data as *mut ClientListContext);
+    if let Err(err) = handle_client_list_update(context.device_id) {
+        eprintln!("[prismd] Failed to refresh client list: {}", err);
+    }
+
+    0
+}
+
+fn handle_client_list_update(device_id: AudioObjectID) -> Result<(), String> {
+    let clients = fetch_client_list(device_id)?;
+
+    {
+        let mut cache = CLIENT_LIST.lock().expect("client list mutex poisoned");
+        *cache = clients.clone();
+    }
+
+    println!("[prismd] Client list updated ({} entries)", clients.len());
+    for entry in &clients {
+        println!(
+            "    pid={} client_id={} offset={}",
+            entry.pid, entry.client_id, entry.channel_offset
+        );
+    }
+
+    Ok(())
+}
+
+fn fetch_client_list(device_id: AudioObjectID) -> Result<Vec<ClientEntry>, String> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: K_AUDIO_PRISM_PROPERTY_CLIENT_LIST,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMaster,
+    };
+
+    let mut data_size = mem::size_of::<CFDataRef>() as u32;
+    let mut cfdata_ref: CFDataRef = std::ptr::null();
+    let status = unsafe {
+        AudioObjectGetPropertyData(
+            device_id,
+            &address,
+            0,
+            std::ptr::null(),
+            &mut data_size,
+            &mut cfdata_ref as *mut _ as *mut _,
+        )
+    };
+
+    if status != 0 {
+        return Err(format!(
+            "AudioObjectGetPropertyData('clnt') failed with status {}",
+            status
+        ));
+    }
+
+    if cfdata_ref.is_null() {
+        return Ok(Vec::new());
+    }
+
+    let cfdata = unsafe { CFData::wrap_under_create_rule(cfdata_ref) };
+    let bytes = cfdata.bytes();
+    let mut cursor = Cursor::new(bytes);
+    let value = Value::from_reader(&mut cursor)
+        .map_err(|err| format!("Failed to parse client list plist: {}", err))?;
+
+    Ok(parse_client_list_value(value))
+}
+
+fn parse_client_list_value(value: Value) -> Vec<ClientEntry> {
+    match value {
+        Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| match item {
+                Value::Dictionary(dict) => {
+                    let pid = dict
+                        .get("pid")
+                        .and_then(|v| v.as_signed_integer())
+                        .unwrap_or(0) as i32;
+                    let client_id = dict
+                        .get("client_id")
+                        .and_then(|v| v.as_unsigned_integer())
+                        .unwrap_or(0) as u32;
+                    let channel_offset = dict
+                        .get("channel_offset")
+                        .and_then(|v| v.as_unsigned_integer())
+                        .unwrap_or(0) as u32;
+                    Some(ClientEntry {
+                        pid,
+                        client_id,
+                        channel_offset,
+                    })
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn print_client_snapshot() {
+    let cache = CLIENT_LIST.lock().expect("client list mutex poisoned");
+    if cache.is_empty() {
+        println!("No active clients.");
+        return;
+    }
+
+    println!("Current clients ({}):", cache.len());
+    for entry in cache.iter() {
+        println!(
+            "    pid={} client_id={} offset={}",
+            entry.pid, entry.client_id, entry.channel_offset
+        );
+    }
+}
+
+fn register_client_list_listener(device_id: AudioObjectID) -> Result<(), String> {
+    let address = AudioObjectPropertyAddress {
+        mSelector: K_AUDIO_PRISM_PROPERTY_CLIENT_LIST,
+        mScope: kAudioObjectPropertyScopeGlobal,
+        mElement: kAudioObjectPropertyElementMaster,
+    };
+
+    let context = Box::new(ClientListContext { device_id });
+    let context_ptr = Box::into_raw(context);
+    let status = unsafe {
+        AudioObjectAddPropertyListener(
+            device_id,
+            &address,
+            Some(client_list_listener),
+            context_ptr as *mut _,
+        )
+    };
+
+    if status != 0 {
+        unsafe {
+            drop(Box::from_raw(context_ptr));
+        }
+        return Err(format!(
+            "AudioObjectAddPropertyListener('clnt') failed with status {}",
+            status
+        ));
+    }
+
+    Ok(())
+}
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -21,15 +193,23 @@ struct PrismRoutingUpdate {
 fn main() {
     println!("Prism Daemon (prismd) starting...");
 
-    let device_id = match find_prism_device() {
-        Some(id) => id,
-        None => {
-            eprintln!("Prism driver not found!");
-            return;
-        }
+    let device_id = if let Some(id) = find_prism_device() {
+        id
+    } else {
+        eprintln!("Prism driver not found!");
+        return;
     };
 
     println!("Found Prism Device ID: {}", device_id);
+
+    match register_client_list_listener(device_id) {
+        Ok(()) => {
+            if let Err(err) = handle_client_list_update(device_id) {
+                eprintln!("[prismd] Initial client list fetch failed: {}", err);
+            }
+        }
+        Err(err) => eprintln!("[prismd] Failed to register client list listener: {}", err),
+    }
 
     // If invoked with args, run a single command and exit.
     // Usage: prismd set <PID> <OFFSET>
@@ -66,13 +246,15 @@ fn main() {
     println!("Entering interactive mode. Type 'help' for commands.");
     let stdin = io::stdin();
     let mut stdout = io::stdout();
+    let _ = stdout.write_all(b"> ");
+    let _ = stdout.flush();
     for line in stdin.lock().lines() {
         let line = match line { Ok(l) => l.trim().to_string(), Err(_) => continue };
         if line.is_empty() { continue; }
         let parts: Vec<&str> = line.split_whitespace().collect();
         match parts[0] {
             "help" => {
-                println!("Commands:\n  set <PID> <OFFSET>  - send routing update\n  list                - list device properties\n  exit                - quit");
+                println!("Commands:\n  set <PID> <OFFSET>  - send routing update\n  list                - list device properties\n  clients             - show current clients\n  exit                - quit");
             }
             "set" => {
                 if parts.len() >= 3 {
@@ -85,10 +267,12 @@ fn main() {
                 } else { eprintln!("Usage: set <PID> <OFFSET>"); }
             }
             "list" => { list_properties(device_id); }
+            "clients" => { print_client_snapshot(); }
             "exit" | "quit" => { break; }
             _ => { eprintln!("Unknown command: {}", parts[0]); }
         }
-        let _ = stdout.write_all(b"> "); let _ = stdout.flush();
+        let _ = stdout.write_all(b"> ");
+        let _ = stdout.flush();
     }
 }
 

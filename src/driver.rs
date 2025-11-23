@@ -1,8 +1,10 @@
 use coreaudio_sys::*;
+use core_foundation::base::TCFType;
+use core_foundation::data::{CFData, CFDataRef};
+use plist::{Dictionary, Value};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, AtomicI32, AtomicBool, Ordering};
-use std::io::BufRead;
+use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 // use std::collections::HashMap; // Removed
 // use std::sync::RwLock; // Removed
 
@@ -27,7 +29,7 @@ impl PrismConfig {
     }
 
     fn load() -> Self {
-        let mut config = Self::default();
+        let config = Self::default();
         log_msg("Prism: Using default config");
         config
     }
@@ -48,6 +50,33 @@ pub struct ClientSlot {
     pub client_id: AtomicU32,
     pub channel_offset: AtomicUsize,
     pub pid: AtomicI32,
+}
+
+fn encode_client_list(driver: &PrismDriver) -> Vec<u8> {
+    let mut array = Vec::new();
+
+    for slot in driver.client_slots.iter() {
+        let client_id = slot.client_id.load(Ordering::Acquire);
+        if client_id == 0 {
+            continue;
+        }
+        let pid = slot.pid.load(Ordering::Acquire);
+        let offset = slot.channel_offset.load(Ordering::Acquire) as u32;
+
+        let mut dict = Dictionary::new();
+        dict.insert("client_id".into(), Value::from(i64::from(client_id)));
+        dict.insert("pid".into(), Value::from(pid as i64));
+        dict.insert("channel_offset".into(), Value::from(i64::from(offset)));
+
+        array.push(Value::Dictionary(dict));
+    }
+
+    let value = Value::Array(array);
+    let mut buf = Vec::new();
+    if plist::to_writer_binary(&mut buf, &value).is_err() {
+        buf.clear();
+    }
+    buf
 }
 
 #[repr(C)]
@@ -175,6 +204,13 @@ unsafe extern "C" fn initialize(
         };
         prop_changed(host, DEVICE_ID, 1, &addr_rout);
 
+        let addr_clnt = AudioObjectPropertyAddress {
+            mSelector: kAudioPrismPropertyClientList,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMaster,
+        };
+        prop_changed(host, DEVICE_ID, 1, &addr_clnt);
+
         let addr_owned = AudioObjectPropertyAddress {
             mSelector: kAudioObjectPropertyOwnedObjects,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -236,6 +272,8 @@ unsafe extern "C" fn add_device_client(
         slot.channel_offset.store(channel_offset, Ordering::SeqCst);
         slot.pid.store(pid as i32, Ordering::SeqCst);
         slot.client_id.store(client_id, Ordering::Release);
+
+        notify_device_property_changed(driver, kAudioPrismPropertyClientList);
     }
     0
 }
@@ -262,6 +300,8 @@ unsafe extern "C" fn remove_device_client(
             slot.client_id.store(0, Ordering::Release); // Reset to 0
             slot.channel_offset.store(0, Ordering::Relaxed);
             slot.pid.store(0, Ordering::Relaxed);
+
+            notify_device_property_changed(driver, kAudioPrismPropertyClientList);
         }
     }
     0
@@ -323,7 +363,7 @@ const kAudioDevicePropertyRingBufferFrameSize: AudioObjectPropertySelector = 0x7
 #[allow(non_upper_case_globals)]
 const kAudioPrismPropertyRoutingTable: AudioObjectPropertySelector = 0x726F7574; // 'rout'
 #[allow(non_upper_case_globals)]
-const kAudioObjectPropertySelectorNone: AudioObjectPropertySelector = 0;
+const kAudioPrismPropertyClientList: AudioObjectPropertySelector = 0x636C6E74; // 'clnt'
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
@@ -412,7 +452,8 @@ unsafe extern "C" fn has_property(
                selector == kAudioObjectPropertyScope ||
                selector == kAudioObjectPropertyElement ||
                selector == kAudioDevicePropertyBufferFrameSize ||
-               selector == kAudioPrismPropertyRoutingTable { // 'rout' OK
+               selector == kAudioPrismPropertyRoutingTable ||
+               selector == kAudioPrismPropertyClientList {
                 log_msg(&format!("Prism: HasProperty Device Known. Object: {}, Selector: {}", object_id, selector));
                 true
             } else {
@@ -535,7 +576,7 @@ unsafe extern "C" fn get_property_data_size(
             // ★ カスタムプロパティ (カタログ)
             if selector == kAudioObjectPropertyCustomPropertyInfoList {
                 // Deviceだけが「カスタムプロパティリスト」を持つ
-                let size = std::mem::size_of::<AudioServerPlugInCustomPropertyInfo>() as UInt32;
+                let size = (2 * std::mem::size_of::<AudioServerPlugInCustomPropertyInfo>()) as UInt32;
                 *_out_data_size = size;
                 log_msg(&format!("Prism: Device has 'cust', size={}", size));
                 return 0;
@@ -546,6 +587,10 @@ unsafe extern "C" fn get_property_data_size(
                 let size = std::mem::size_of::<PrismRoutingUpdate>() as UInt32;
                 *_out_data_size = size;
                 log_msg(&format!("Prism: Device has 'rout', size={}", size));
+                return 0;
+            } else if selector == kAudioPrismPropertyClientList {
+                *_out_data_size = std::mem::size_of::<CFDataRef>() as UInt32;
+                log_msg("Prism: Device has 'clnt' (CFDataRef)");
                 return 0;
             }
 
@@ -736,25 +781,23 @@ unsafe extern "C" fn get_property_data(
             if selector == kAudioObjectPropertyCustomPropertyInfoList {
                  log_msg("Prism: GetPropertyData(Device) -> CustomPropertyInfoList");
 
-                 let need = std::mem::size_of::<AudioServerPlugInCustomPropertyInfo>() as UInt32;
+                 let need = (2 * std::mem::size_of::<AudioServerPlugInCustomPropertyInfo>()) as UInt32;
                 if *_out_data_size < need {
                     return kAudioHardwareBadPropertySizeError as OSStatus;
                 }
 
                  let out = _out_data as *mut AudioServerPlugInCustomPropertyInfo;
                  unsafe {
-                     // ここで 'rout' を宣伝する
+                     // Entry 0: 'rout' property definition
                      (*out).mSelector = kAudioPrismPropertyRoutingTable;
-
-                     // mPropertyDataType/mQualifierDataType は CoreAudio の定数を使う
-                     // BGM と同様に、クライアントがカスタムプロパティを発見しやすいよう
-                     // CFPropertyList を使用して宣伝する（多くのクライアントは 'plst' を期待する）
-                     // Advertise CFPropertyList so clients (and debug tools) enumerate
-                     // this property as a plist. The runtime SetPropertyData handler
-                     // will accept either a raw PrismRoutingUpdate struct or a
-                     // CFDataRef containing the binary struct.
                      (*out).mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
                      (*out).mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
+
+                     // Entry 1: 'clnt' property definition
+                     let next = out.add(1);
+                     (*next).mSelector = kAudioPrismPropertyClientList;
+                     (*next).mPropertyDataType = kAudioServerPlugInCustomPropertyDataTypeCFPropertyList;
+                     (*next).mQualifierDataType = kAudioServerPlugInCustomPropertyDataTypeNone;
                  }
                  *_out_data_size = need;
                  return 0;
@@ -772,6 +815,18 @@ unsafe extern "C" fn get_property_data(
                     *out = PrismRoutingUpdate { pid: 0, channel_offset: 0 };
                 }
                 *_out_data_size = size;
+                return 0;
+            } else if selector == kAudioPrismPropertyClientList {
+                log_msg("Prism: GetPropertyData(Device) -> ClientList");
+                let encoded = encode_client_list(&*driver);
+                let cfdata = CFData::from_buffer(&encoded);
+                let cfdata_ref = cfdata.as_concrete_TypeRef();
+                let out = _out_data as *mut CFDataRef;
+                unsafe {
+                    *out = cfdata_ref;
+                }
+                std::mem::forget(cfdata);
+                *_out_data_size = std::mem::size_of::<CFDataRef>() as UInt32;
                 return 0;
             }
 
@@ -1055,6 +1110,7 @@ unsafe extern "C" fn set_property_data(
                 slot.channel_offset.store(offset as usize, Ordering::Release);
             }
             log_msg(&format!("Prism: Routing Update ROUT Broadcast. Offset={}", offset));
+            notify_device_property_changed(driver, kAudioPrismPropertyClientList);
             return 0;
         }
 
@@ -1070,6 +1126,8 @@ unsafe extern "C" fn set_property_data(
             }
             if !found {
                 log_msg(&format!("Prism: Routing Update via ROUT Failed. PID={} not found", pid));
+            } else {
+                notify_device_property_changed(driver, kAudioPrismPropertyClientList);
             }
         }
 
@@ -1357,6 +1415,24 @@ fn log_msg(msg: &str) {
         // syslog(LOG_USER, ...)
         let c_msg = CString::new(msg).unwrap_or_else(|_| CString::new("prism: log error").unwrap());
         libc::syslog(libc::LOG_USER | libc::LOG_INFO, c_msg.as_ptr());
+    }
+}
+
+fn notify_device_property_changed(driver: *mut PrismDriver, selector: AudioObjectPropertySelector) {
+    unsafe {
+        if driver.is_null() {
+            return;
+        }
+        if let Some(host) = (*driver).host {
+            if let Some(prop_changed) = (*host).PropertiesChanged {
+                let address = AudioObjectPropertyAddress {
+                    mSelector: selector,
+                    mScope: kAudioObjectPropertyScopeGlobal,
+                    mElement: kAudioObjectPropertyElementMaster,
+                };
+                prop_changed(host, DEVICE_ID, 1, &address);
+            }
+        }
     }
 }
 

@@ -43,6 +43,7 @@ Interactive REPL
 - `help` — show available commands
 - `set <PID> <OFFSET>` — send a routing update for PID
 - `list` — list the driver's custom properties (to inspect available selectors)
+- `clients` — print the driver's current client snapshot (PID, client id, offset)
 - `exit` / `quit` — quit the REPL
 
 How routing updates work

@@ -20,6 +20,7 @@ cocoa = "0.26.1"
 objc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+plist = "1.6"
 
 [profile.release]
 lto = true
