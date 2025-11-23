@@ -15,7 +15,6 @@
 
         devShells.default = pkgs.mkShell {
           buildInputs = with pkgs; [
-            cargo
             rustup
           ];
 
@@ -24,6 +23,9 @@
           # `channel` and ensure that toolchain and components are installed
           # via rustup so `cargo`, `clippy`, and `rustfmt` behave as expected.
           shellHook = ''
+            # Prefer rustup-managed toolchains over the Nix-provided cargo/rustc
+            export PATH="$HOME/.cargo/bin:$PATH"
+
             # Default to stable if no toolchain file found or parsing fails.
             channel=stable
             if [ -f rust-toolchain.toml ]; then
