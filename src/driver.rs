@@ -1489,7 +1489,7 @@ unsafe extern "C" fn do_io_operation(
             if frames <= frames_until_wrap {
                 // No wrapping needed
                 for i in 0..frames {
-                    let in_l = *input.add((i * input_channels));
+                    let in_l = *input.add(i * input_channels );
                     let in_r = *input.add(i * input_channels + 1);
 
                     let dst_idx = (w_pos + i) * channels + channel_offset;
@@ -1501,7 +1501,7 @@ unsafe extern "C" fn do_io_operation(
             } else {
                 // Wrapping needed
                 for i in 0..frames_until_wrap {
-                    let in_l = *input.add((i * input_channels));
+                    let in_l = *input.add(i * input_channels );
                     let in_r = *input.add(i * input_channels + 1);
                     let dst_idx = (w_pos + i) * channels + channel_offset;
                     if dst_idx + 1 < buffer_len {
@@ -1513,7 +1513,7 @@ unsafe extern "C" fn do_io_operation(
                 let remainder = frames - frames_until_wrap;
                 for i in 0..remainder {
                     let src_idx = frames_until_wrap + i;
-                    let in_l = *input.add((src_idx * input_channels));
+                    let in_l = *input.add(src_idx * input_channels );
                     let in_r = *input.add(src_idx * input_channels + 1);
                     let dst_idx = i * channels + channel_offset;
                     if dst_idx + 1 < buffer_len {
