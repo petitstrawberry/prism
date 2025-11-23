@@ -22,14 +22,14 @@
 	<string>1</string>
 	<key>CFPlugInFactories</key>
 	<dict>
-		<key>F5962966-3960-4433-BB66-77B22D277777</key>
+		<key>8946A3AF-9EB1-4B8E-BCC1-BF24E4239BE2</key>
 		<string>AudioServerPlugInMain</string>
 	</dict>
 	<key>CFPlugInTypes</key>
 	<dict>
-		<key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+		<key>DF2AACB8-0A42-413B-8E0C-2E72D513B014</key>
 		<array>
-			<string>F5962966-3960-4433-BB66-77B22D277777</string>
+			<string>8946A3AF-9EB1-4B8E-BCC1-BF24E4239BE2</string>
 		</array>
 	</dict>
 </dict>

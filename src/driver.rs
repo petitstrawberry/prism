@@ -28,33 +28,6 @@ impl PrismConfig {
 
     fn load() -> Self {
         let mut config = Self::default();
-        let path = "/Library/Application Support/Prism/config.txt";
-
-        if let Ok(file) = std::fs::File::open(path) {
-            let reader = std::io::BufReader::new(file);
-            for line in reader.lines() {
-                if let Ok(l) = line {
-                    // Ignore comments
-                    if l.trim().starts_with('#') { continue; }
-                    let parts: Vec<&str> = l.split('=').collect();
-                    if parts.len() == 2 {
-                        let key = parts[0].trim();
-                        if let Ok(val) = parts[1].trim().parse::<u32>() {
-                            match key {
-                                "buffer_frame_size" => config.buffer_frame_size = val,
-                                "safety_offset" => config.safety_offset = val,
-                                "ring_buffer_frame_size" => config.ring_buffer_frame_size = val,
-                                "zero_timestamp_period" => config.zero_timestamp_period = val,
-                                "num_channels" => config.num_channels = val,
-                                _ => {}
-                            }
-                        }
-                    }
-                }
-            }
-            log_msg(&format!("Prism: Loaded config from {}", path));
-            return config;
-        }
         log_msg("Prism: Using default config");
         config
     }
