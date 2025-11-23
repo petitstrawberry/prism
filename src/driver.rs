@@ -5,8 +5,8 @@ use plist::{Dictionary, Value};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-// use std::collections::HashMap; // Removed
-// use std::sync::RwLock; // Removed
+// use std::collections::HashMap;
+// use std::sync::RwLock;
 
 #[derive(Debug, Clone, Copy)]
 pub struct PrismConfig {
@@ -37,7 +37,7 @@ impl PrismConfig {
 
 // Define the Host Interface struct locally since coreaudio-sys seems to treat it as opaque or we are having trouble dereferencing it.
 // This layout must match the C definition of AudioServerPlugInHostInterface.
-// Removed PrismHostInterface as it is not used yet.
+// (PrismHostInterface omitted)
 
 // UUID for the driver interface (kAudioServerPlugInDriverInterfaceUUID)
 // This should match what is expected by Core Audio.
@@ -129,7 +129,7 @@ unsafe extern "C" fn query_interface(
 ) -> HRESULT {
     // Minimal implementation: We only support IUnknown and the Driver Interface.
     // For now, just return S_OK and self, assuming the caller asks for the right thing.
-    // TODO: Proper UUID check.
+    // UUID check may be required.
     log_msg(&format!("Prism: QueryInterface called. UUID: {:02X}{:02X}{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}",
         _uuid.byte0, _uuid.byte1, _uuid.byte2, _uuid.byte3,
         _uuid.byte4, _uuid.byte5,
@@ -171,7 +171,7 @@ unsafe extern "C" fn initialize(
     (*driver).host = Some(host);
 
     if let Some(prop_changed) = (*host).PropertiesChanged {
-        // 1. Device List (プラグインレベル)
+        // 1. Device List (plugin-level)
         let addr_dev_list = AudioObjectPropertyAddress {
             mSelector: kAudioPlugInPropertyDeviceList,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -179,7 +179,7 @@ unsafe extern "C" fn initialize(
         };
         prop_changed(host, kAudioObjectPlugInObject, 1, &addr_dev_list);
 
-        // 2. Custom Property Info (カタログ更新)
+        // 2. Custom Property Info (catalog update)
         let addr_cust = AudioObjectPropertyAddress {
             mSelector: kAudioObjectPropertyCustomPropertyInfoList,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -188,7 +188,7 @@ unsafe extern "C" fn initialize(
         prop_changed(host, kAudioObjectPlugInObject, 1, &addr_cust);
         prop_changed(host, DEVICE_ID, 1, &addr_cust);
 
-        // ★ 3. Device Name
+        // 3. Device Name
         let addr_name = AudioObjectPropertyAddress {
             mSelector: kAudioDevicePropertyDeviceName,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -196,7 +196,7 @@ unsafe extern "C" fn initialize(
         };
         prop_changed(host, DEVICE_ID, 1, &addr_name);
 
-        // 4. Routing Table (routも念のため)
+        // 4. Routing Table (include 'rout' as well, just in case)
         let addr_rout = AudioObjectPropertyAddress {
             mSelector: kAudioPrismPropertyRoutingTable,
             mScope: kAudioObjectPropertyScopeGlobal,
@@ -262,9 +262,8 @@ unsafe extern "C" fn add_device_client(
         let slots = &(*driver).client_slots;
         let slot = &slots[idx];
 
-        // Prism 2.0: Dumb Driver
-        // We default to channel 0 (Passthrough) or a specific "unassigned" state.
-        // The Daemon will update this via SetProperty('rout').
+        // We default to channel 0 (passthrough) or an explicit unassigned state.
+        // The daemon updates this via SetProperty('rout').
         let channel_offset = 0;
 
         log_msg(&format!("Prism: Client Added. ID={}, PID={}, Slot={}, Default Offset={}", client_id, pid, idx, channel_offset));
@@ -391,8 +390,8 @@ unsafe extern "C" fn has_property(
     let address = *_address;
     let selector = address.mSelector;
 
-    // ★ 削除: ここにあった Global な forced true は消す！
-    // 厳密に match の中で判定します。
+    // Legacy forced-true behavior is not applied.
+    // Evaluate property presence strictly within the match arms.
 
     let res = match object_id {
         // --------------------------------------------------------
@@ -417,7 +416,7 @@ unsafe extern "C" fn has_property(
         },
 
         // --------------------------------------------------------
-        // 2. Device Object (ここだけ rout / cust を許可)
+        // 2. Device Object (only here allow 'rout' / 'cust')
         // --------------------------------------------------------
         DEVICE_ID => {
             if selector == kAudioObjectPropertyBaseClass ||
@@ -463,14 +462,14 @@ unsafe extern "C" fn has_property(
         },
 
         // --------------------------------------------------------
-        // 3. Stream Object (cust / rout は削除！)
+        // 3. Stream Object (do NOT include 'cust' / 'rout' here)
         // --------------------------------------------------------
         INPUT_STREAM_ID | OUTPUT_STREAM_ID => {
             if selector == kAudioObjectPropertyBaseClass ||
                selector == kAudioObjectPropertyClass ||
                selector == kAudioObjectPropertyOwner ||
                selector == kAudioObjectPropertyControlList ||
-               // ★ 削除: kAudioObjectPropertyCustomPropertyInfoList はここに入れない
+               // (do not include kAudioObjectPropertyCustomPropertyInfoList here)
                selector == kAudioStreamPropertyDirection ||
                selector == kAudioStreamPropertyTerminalType ||
                selector == kAudioStreamPropertyStartingChannel ||
@@ -538,20 +537,20 @@ unsafe extern "C" fn get_property_data_size(
     _qualifier_data: *const c_void,
     _out_data_size: *mut UInt32,
 ) -> OSStatus {
-    // let driver = _self as *mut PrismDriver; // 今回はconfigアクセス不要ならコメントアウト可
+    // let driver = _self as *mut PrismDriver; // can be commented out if config access is not required
     let address = *_address;
     let selector = address.mSelector;
 
-    // デバッグログ: 必要に応じてコメントアウトしてください
+    // Debug logs: comment out if too verbose
     // log_msg(&format!("Prism: GetPropertyDataSize called. Object: {}, Selector: {}", object_id, selector));
 
     match object_id {
         // ---------------------------------------------------------------------
-        // 1. プラグインオブジェクト
+        // 1. Plugin object
         // ---------------------------------------------------------------------
         id if id == kAudioObjectPlugInObject => {
             if selector == kAudioObjectPropertyCustomPropertyInfoList {
-                // プラグイン自体にはカスタムプロパティを持たせない
+                // The plugin itself does not have custom properties
                 *_out_data_size = 0;
             } else if selector == kAudioObjectPropertyBaseClass ||
                selector == kAudioObjectPropertyClass ||
@@ -570,19 +569,19 @@ unsafe extern "C" fn get_property_data_size(
         },
 
         // ---------------------------------------------------------------------
-        // 2. デバイスオブジェクト (ここが本命)
+        // 2. Device object
         // ---------------------------------------------------------------------
         DEVICE_ID => {
-            // ★ カスタムプロパティ (カタログ)
+            // Custom property (catalog)
             if selector == kAudioObjectPropertyCustomPropertyInfoList {
-                // Deviceだけが「カスタムプロパティリスト」を持つ
+                // Only the Device has a "custom property list"
                 let size = (2 * std::mem::size_of::<AudioServerPlugInCustomPropertyInfo>()) as UInt32;
                 *_out_data_size = size;
                 log_msg(&format!("Prism: Device has 'cust', size={}", size));
                 return 0;
             }
 
-            // ★ カスタムプロパティ (実データ: 'rout')
+            // Custom property (actual data: 'rout')
             if selector == kAudioPrismPropertyRoutingTable {
                 let size = std::mem::size_of::<PrismRoutingUpdate>() as UInt32;
                 *_out_data_size = size;
@@ -594,7 +593,7 @@ unsafe extern "C" fn get_property_data_size(
                 return 0;
             }
 
-            // --- 標準プロパティ ---
+            // --- Standard properties ---
             if selector == kAudioObjectPropertyControlList {
                 *_out_data_size = 0;
             } else if selector == kAudioDevicePropertyStreamsIsSettable ||
@@ -648,10 +647,10 @@ unsafe extern "C" fn get_property_data_size(
         },
 
         // ---------------------------------------------------------------------
-        // 3. ストリームオブジェクト
+        // 3. Stream object
         // ---------------------------------------------------------------------
         INPUT_STREAM_ID | OUTPUT_STREAM_ID => {
-            // ★ ストリームはカスタムプロパティを持たない (サイズ 0)
+            // Streams do not have custom properties (size 0)
             if selector == kAudioObjectPropertyCustomPropertyInfoList {
                 *_out_data_size = 0;
                 return 0;
@@ -699,7 +698,6 @@ unsafe extern "C" fn get_property_data(
     let address = *_address;
     let selector = address.mSelector;
 
-    // ログが多すぎる場合は適宜コメントアウトしてください
     // log_msg(&format!("Prism: GetPropertyData called. Object: {}, Selector: {}", object_id, selector));
 
     if _out_data.is_null() {
@@ -708,17 +706,14 @@ unsafe extern "C" fn get_property_data(
 
     match object_id {
         // ---------------------------------------------------------------------
-        // 1. プラグインオブジェクト (Driver PlugIn)
+        // 1. Plugin object (Driver PlugIn)
         // ---------------------------------------------------------------------
         id if id == kAudioObjectPlugInObject => {
             if selector == kAudioObjectPropertyCustomPropertyInfoList {
-                // プラグイン自体はカスタムプロパティを持たない（デバイスに持たせる）
+                // The plugin does not own custom properties (they belong to the Device)
                 *_out_data_size = 0;
                 return 0;
-            }
-
-            // ... (既存の標準プロパティ処理) ...
-            else if selector == kAudioObjectPropertyBaseClass {
+            } else if selector == kAudioObjectPropertyBaseClass {
                 let out = _out_data as *mut AudioClassID;
                 *out = kAudioObjectClassID;
                 *_out_data_size = std::mem::size_of::<AudioClassID>() as UInt32;
@@ -743,7 +738,7 @@ unsafe extern "C" fn get_property_data(
                 *out = DEVICE_ID;
                 *_out_data_size = std::mem::size_of::<AudioObjectID>() as UInt32;
 
-                // 遅延通知: プラグインのデバイスリストが取得された後に 'cust' 通知を送る
+                // Late notification: send 'cust' after the plugin's device list has been retrieved
                 if let Some(host) = (*driver).host {
                     if let Some(prop_changed) = (*host).PropertiesChanged {
                         let addr_cust = AudioObjectPropertyAddress {
@@ -774,10 +769,10 @@ unsafe extern "C" fn get_property_data(
         },
 
         // ---------------------------------------------------------------------
-        // 2. デバイスオブジェクト (The Prism Device)
+        // 2. Device object (The Prism Device)
         // ---------------------------------------------------------------------
         DEVICE_ID => {
-            // ★ カスタムプロパティの定義 (カタログ)
+            // Custom property definitions (catalog)
             if selector == kAudioObjectPropertyCustomPropertyInfoList {
                  log_msg("Prism: GetPropertyData(Device) -> CustomPropertyInfoList");
 
@@ -802,16 +797,16 @@ unsafe extern "C" fn get_property_data(
                  *_out_data_size = need;
                  return 0;
 
-            // ★ カスタムプロパティの実データ ('rout')
+            // Custom property payload ('rout')
             } else if selector == kAudioPrismPropertyRoutingTable {
                 log_msg("Prism: GetPropertyData(Device) -> RoutingTable");
-                // HALはサイズチェックのために in_data_size=0 で呼ぶことがあるためチェックを緩める
-                // しかし書き込みには構造体サイズが必要
+                // HAL may call with in_data_size=0 for size checks, so relax the check
+                // However, writing still requires the structure size
                 let size = std::mem::size_of::<PrismRoutingUpdate>() as UInt32;
 
                 let out = _out_data as *mut PrismRoutingUpdate;
                 unsafe {
-                    // 読み込み時はダミーまたは現在の状態を返す
+                    // When reading, return a dummy or current state
                     *out = PrismRoutingUpdate { pid: 0, channel_offset: 0 };
                 }
                 *_out_data_size = size;
@@ -828,10 +823,7 @@ unsafe extern "C" fn get_property_data(
                 std::mem::forget(cfdata);
                 *_out_data_size = std::mem::size_of::<CFDataRef>() as UInt32;
                 return 0;
-            }
-
-            // ... (既存の標準プロパティ処理) ...
-            else if selector == kAudioObjectPropertyControlList {
+            } else if selector == kAudioObjectPropertyControlList {
                 *_out_data_size = 0;
             } else if selector == kAudioObjectPropertyBaseClass {
                 let out = _out_data as *mut AudioClassID;
@@ -965,16 +957,14 @@ unsafe extern "C" fn get_property_data(
         },
 
         // ---------------------------------------------------------------------
-        // 3. ストリームオブジェクト
+        // 3. Stream object
         // ---------------------------------------------------------------------
         INPUT_STREAM_ID | OUTPUT_STREAM_ID => {
-             // ストリームはカスタムプロパティを持たない
+             // Streams do not have custom properties
             if selector == kAudioObjectPropertyCustomPropertyInfoList {
                 *_out_data_size = 0;
                 return 0;
-            }
-            // ... (既存の処理) ...
-            else if selector == kAudioObjectPropertyControlList {
+            } else if selector == kAudioObjectPropertyControlList {
                 *_out_data_size = 0;
             } else if selector == kAudioObjectPropertyBaseClass {
                 let out = _out_data as *mut AudioClassID;

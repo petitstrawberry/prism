@@ -5,17 +5,17 @@
 #include <string.h>
 #include <unistd.h>
 
-// --- 定数定義 (Headers Fix) ---
+// --- Constant definitions (Headers Fix) ---
 
 // 'rout' (0x726F7574)
 #define kAudioPrismPropertyRoutingTable 0x726F7574
 
-// 'cust' (0x63757374) - 本来はドライバ用ヘッダーにある定数
+// 'cust' (0x63757374) - This constant normally belongs in the driver's header
 #ifndef kAudioObjectPropertyCustomPropertyInfoList
 #define kAudioObjectPropertyCustomPropertyInfoList 0x63757374
 #endif
 
-// デフォルトUID（Prism用）
+// Default UID (for Prism)
 #define DEFAULT_DEVICE_UID "com.petitstrawberry.driver.Prism.Device"
 
 // -----------------------------
@@ -59,11 +59,11 @@ int main(int argc, char** argv) {
     for(int i=0; i<count; i++) {
         CFStringRef uid = NULL;
         UInt32 s = sizeof(CFStringRef);
-        // エラーチェックを緩めてとにかく探す
+
         if(AudioObjectGetPropertyData(ids[i], &addr_uid, 0, NULL, &s, &uid) == 0 && uid != NULL) {
             char buf[128];
             if (CFStringGetCString(uid, buf, 128, kCFStringEncodingUTF8)) {
-                // printf("Checking: %s\n", buf); // デバッグ用
+                // printf("Checking: %s\n", buf); // for debugging
                 if(strcmp(buf, device_uid) == 0) {
                     prismID = ids[i];
                     CFRelease(uid);
@@ -83,10 +83,10 @@ int main(int argc, char** argv) {
 
     // 2. Inspect 'cust' (Custom Property List)
     printf("\n[Inspecting 'cust' Property]\n");
-    // ★★★ 以下の遅延コードを追加 ★★★
-printf("Waiting for HAL synchronization...\n");
-// 100ms 程度の遅延を入れることで、HALがバックグラウンドでプロパティを読み込む猶予を与える
-usleep(100000); // 100 milliseconds
+    // NOTE: Add a short delay to allow the HAL time to synchronize
+    printf("Waiting for HAL synchronization...\n");
+    // Insert ~100ms delay to give HAL background processing time to load properties
+    usleep(100000); // 100 milliseconds
 
     AudioObjectPropertyAddress addr_cust = {
         kAudioObjectPropertyCustomPropertyInfoList,
