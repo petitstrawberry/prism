@@ -8,13 +8,8 @@ mod socket;
 
 use coreaudio_sys::*;
 use host::{
-    fetch_client_list,
-    find_prism_device,
-    fourcc_to_string_from_le,
-    read_custom_property_info,
-    send_rout_update,
-    ClientEntry,
-    K_AUDIO_PRISM_PROPERTY_CLIENT_LIST,
+    fetch_client_list, find_prism_device, fourcc_to_string_from_le, read_custom_property_info,
+    send_rout_update, ClientEntry, K_AUDIO_PRISM_PROPERTY_CLIENT_LIST,
 };
 use std::ffi::c_void;
 use std::fs;
@@ -111,10 +106,9 @@ fn start_ipc_server(device_id: AudioObjectID) -> io::Result<()> {
     }
 
     let listener = UnixListener::bind(socket::PRISM_SOCKET_PATH)?;
-    if let Err(err) = fs::set_permissions(
-        socket::PRISM_SOCKET_PATH,
-        fs::Permissions::from_mode(0o660),
-    ) {
+    if let Err(err) =
+        fs::set_permissions(socket::PRISM_SOCKET_PATH, fs::Permissions::from_mode(0o660))
+    {
         eprintln!(
             "[prismd] Warning: failed to set permissions on {}: {}",
             socket::PRISM_SOCKET_PATH,
@@ -243,10 +237,7 @@ fn format_custom_properties_response(device_id: AudioObjectID) -> Result<String,
     }
 
     let mut out = String::new();
-    out.push_str(&format!(
-        "Custom properties for device {}:\n",
-        device_id
-    ));
+    out.push_str(&format!("Custom properties for device {}:\n", device_id));
 
     for (index, entry) in entries.iter().enumerate() {
         let (selector_text, selector_hex) = format_fourcc(entry.selector);

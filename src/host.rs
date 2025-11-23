@@ -1,7 +1,7 @@
-use coreaudio_sys::*;
 use core_foundation::base::TCFType;
 use core_foundation::data::{CFData, CFDataRef};
 use core_foundation::string::{CFString, CFStringRef};
+use coreaudio_sys::*;
 use plist::Value;
 use std::ffi::c_void;
 use std::io::Cursor;
@@ -60,7 +60,10 @@ pub fn send_rout_update(device_id: AudioObjectID, pid: i32, offset: u32) -> Resu
     if status == 0 {
         Ok(())
     } else {
-        Err(format!("AudioObjectSetPropertyData failed with status {}", status))
+        Err(format!(
+            "AudioObjectSetPropertyData failed with status {}",
+            status
+        ))
     }
 }
 
@@ -147,13 +150,7 @@ pub fn read_custom_property_info(
 
     let mut data_size: u32 = 0;
     let status_size = unsafe {
-        AudioObjectGetPropertyDataSize(
-            device_id,
-            &cust_address,
-            0,
-            ptr::null(),
-            &mut data_size,
-        )
+        AudioObjectGetPropertyDataSize(device_id, &cust_address, 0, ptr::null(), &mut data_size)
     };
 
     if status_size != 0 {
@@ -176,12 +173,15 @@ pub fn read_custom_property_info(
             0,
             ptr::null(),
             &mut read_size,
-            buffer.as_mut_ptr() as *mut _
+            buffer.as_mut_ptr() as *mut _,
         )
     };
 
     if status != 0 {
-        return Err(format!("AudioObjectGetPropertyData('cust') failed with status {}", status));
+        return Err(format!(
+            "AudioObjectGetPropertyData('cust') failed with status {}",
+            status
+        ));
     }
 
     if read_size == 0 {
@@ -204,9 +204,7 @@ pub fn read_custom_property_info(
 
     let mut out = Vec::new();
     for chunk in buffer.chunks(entry_size) {
-        let raw = unsafe {
-            *(chunk.as_ptr() as *const AudioServerPlugInCustomPropertyInfoRaw)
-        };
+        let raw = unsafe { *(chunk.as_ptr() as *const AudioServerPlugInCustomPropertyInfoRaw) };
 
         out.push(CustomPropertyInfo {
             selector: raw.mSelector,
@@ -261,7 +259,7 @@ pub fn find_prism_device() -> Result<AudioObjectID, String> {
             0,
             ptr::null(),
             &mut list_size,
-            device_ids.as_mut_ptr() as *mut _
+            device_ids.as_mut_ptr() as *mut _,
         )
     };
 
@@ -297,7 +295,7 @@ fn get_device_uid(device_id: AudioObjectID) -> Option<String> {
             0,
             ptr::null(),
             &mut data_size,
-            &mut uid_ref as *mut _ as *mut _
+            &mut uid_ref as *mut _ as *mut _,
         )
     };
 
