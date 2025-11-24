@@ -28,7 +28,7 @@ use std::thread;
 use std::time::Duration;
 
 #[derive(Parser)]
-#[command(name = "prismd", about = "Prism daemon controller")]
+#[command(name = "prismd", about = "Prism daemon for managing audio routing")]
 struct Opts {
     /// Run as a background process
     #[arg(short = 'd', long = "daemonize")]
