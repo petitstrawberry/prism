@@ -1,4 +1,5 @@
 mod driver;
+pub mod ipc;
 
 use coreaudio_sys::*;
 

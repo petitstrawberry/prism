@@ -8,19 +8,172 @@ mod socket;
 
 use coreaudio_sys::*;
 use host::{
-    fetch_client_list, find_prism_device, fourcc_to_string_from_le, read_custom_property_info,
-    send_rout_update, ClientEntry, K_AUDIO_PRISM_PROPERTY_CLIENT_LIST,
+    fetch_client_list, find_prism_device, read_custom_property_info, send_rout_update, ClientEntry,
+    K_AUDIO_PRISM_PROPERTY_CLIENT_LIST,
 };
-use std::ffi::c_void;
+use prism::ipc::{
+    ClientInfoPayload, CommandRequest, CustomPropertyPayload, HelpEntry, RoutingUpdateAck,
+    RpcResponse,
+};
+use serde::Serialize;
+use std::env;
+use std::ffi::{c_void, CStr};
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::{self, Command, Stdio};
 use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
+struct CliOptions {
+    daemonize: bool,
+    daemon_child: bool,
+    show_help: bool,
+    forward_args: Vec<String>,
+}
+
 static CLIENT_LIST: Mutex<Vec<ClientEntry>> = Mutex::new(Vec::new());
+
+fn json_response<T>(status: &str, message: Option<String>, data: Option<T>) -> String
+where
+    T: Serialize,
+{
+    let payload = RpcResponse {
+        status: status.to_string(),
+        message,
+        data,
+    };
+    let serialized = serde_json::to_string(&payload).unwrap_or_else(|err| {
+        serde_json::to_string(&RpcResponse::<serde_json::Value> {
+            status: "error".to_string(),
+            message: Some(format!("failed to serialize response: {}", err)),
+            data: None,
+        })
+        .unwrap()
+    });
+    format!("{}\n", serialized)
+}
+
+fn json_success_with_data<T>(data: T) -> String
+where
+    T: Serialize,
+{
+    json_response("ok", None, Some(data))
+}
+
+fn json_success_with_message_and_data<T>(message: String, data: T) -> String
+where
+    T: Serialize,
+{
+    json_response("ok", Some(message), Some(data))
+}
+
+fn json_error(message: String) -> String {
+    json_response::<serde_json::Value>("error", Some(message), None)
+}
+
+fn help_payload() -> Vec<HelpEntry> {
+    vec![
+        HelpEntry::new(
+            "set",
+            "set <PID> <OFFSET>",
+            "Send a routing update to map PID to channel offset",
+        ),
+        HelpEntry::new(
+            "list",
+            "list",
+            "List custom driver properties exposed by Prism",
+        ),
+        HelpEntry::new(
+            "clients",
+            "clients",
+            "Show active Prism clients with routing offsets",
+        ),
+    ]
+}
+
+fn parse_cli_options() -> CliOptions {
+    let mut options = CliOptions {
+        daemonize: false,
+        daemon_child: false,
+        show_help: false,
+        forward_args: Vec::new(),
+    };
+
+    for arg in env::args().skip(1) {
+        match arg.as_str() {
+            "--daemonize" | "-d" => options.daemonize = true,
+            "--daemon-child" => options.daemon_child = true,
+            "--help" | "-h" => options.show_help = true,
+            _ => options.forward_args.push(arg),
+        }
+    }
+
+    options
+}
+
+fn print_usage() {
+    println!(
+        "Usage: prismd [OPTIONS]\n\nOptions:\n  -d, --daemonize    Run as a background process\n  -h, --help         Show this help message"
+    );
+}
+
+fn spawn_daemon_child(args: &[String]) -> Result<u32, String> {
+    let exe = env::current_exe().map_err(|err| err.to_string())?;
+
+    let mut child_args = Vec::with_capacity(args.len() + 1);
+    child_args.extend(args.iter().cloned());
+    child_args.push("--daemon-child".to_string());
+
+    let child = Command::new(exe)
+        .args(&child_args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .map_err(|err| err.to_string())?;
+
+    Ok(child.id())
+}
+
+fn main() {
+    let options = parse_cli_options();
+
+    if options.daemon_child {
+        run_daemon();
+        return;
+    }
+
+    if options.show_help {
+        print_usage();
+        return;
+    }
+
+    if options.daemonize {
+        match spawn_daemon_child(&options.forward_args) {
+            Ok(pid) => {
+                println!("prismd started in background (pid={})", pid);
+                return;
+            }
+            Err(err) => {
+                eprintln!("[prismd] Failed to daemonize: {}", err);
+                process::exit(1);
+            }
+        }
+    }
+
+    if !options.forward_args.is_empty() {
+        eprintln!(
+            "[prismd] Unknown arguments: {}",
+            options.forward_args.join(" ")
+        );
+        process::exit(2);
+    }
+
+    run_daemon();
+}
 
 struct ClientListContext {
     device_id: AudioObjectID,
@@ -54,9 +207,11 @@ fn handle_client_list_update(device_id: AudioObjectID) -> Result<(), String> {
 
     println!("[prismd] Client list updated ({} entries)", clients.len());
     for entry in &clients {
+        let process_name =
+            resolve_process_name(entry.pid).unwrap_or_else(|| "<unknown>".to_string());
         println!(
-            "    pid={} client_id={} offset={}",
-            entry.pid, entry.client_id, entry.channel_offset
+            "    pid={} ({}) client_id={} offset={}",
+            entry.pid, process_name, entry.client_id, entry.channel_offset
         );
     }
 
@@ -161,52 +316,43 @@ fn write_all_and_flush(mut stream: UnixStream, bytes: &[u8]) -> io::Result<()> {
     stream.flush()
 }
 
-fn handle_ipc_command(command_line: &str, device_id: AudioObjectID) -> String {
-    if command_line.is_empty() {
-        return "error: empty command\n".to_string();
+fn handle_ipc_command(raw: &str, device_id: AudioObjectID) -> String {
+    if raw.is_empty() {
+        return json_error("empty command".to_string());
     }
 
-    let parts: Vec<&str> = command_line.split_whitespace().collect();
-    match parts[0] {
-        "help" => ipc_help_message(),
-        "set" => {
-            if parts.len() < 3 {
-                return "error: usage set <PID> <OFFSET>\n".to_string();
-            }
+    let request: CommandRequest = match serde_json::from_str(raw) {
+        Ok(req) => req,
+        Err(err) => return json_error(format!("invalid request: {}", err)),
+    };
 
-            let pid = match parts[1].parse::<i32>() {
-                Ok(value) => value,
-                Err(_) => return "error: PID must be an integer\n".to_string(),
-            };
-
-            let offset = match parts[2].parse::<u32>() {
-                Ok(value) => value,
-                Err(_) => return "error: OFFSET must be a non-negative integer\n".to_string(),
-            };
-
-            match send_rout_update(device_id, pid, offset) {
-                Ok(()) => format!("Routing update sent: pid={} offset={}\n", pid, offset),
-                Err(err) => format!("error: failed to send routing update: {}\n", err),
-            }
+    match request {
+        CommandRequest::Help => json_success_with_data(help_payload()),
+        CommandRequest::Clients => match build_clients_payload(device_id) {
+            Ok(payload) => json_success_with_data(payload),
+            Err(err) => json_error(format!("failed to fetch clients: {}", err)),
+        },
+        CommandRequest::List => match build_custom_properties_payload(device_id) {
+            Ok(payload) => json_success_with_data(payload),
+            Err(err) => json_error(format!("failed to read custom properties: {}", err)),
+        },
+        CommandRequest::Set { pid, offset } => match send_rout_update(device_id, pid, offset) {
+            Ok(()) => json_success_with_message_and_data(
+                "routing update sent".to_string(),
+                RoutingUpdateAck {
+                    pid,
+                    channel_offset: offset,
+                },
+            ),
+            Err(err) => json_error(format!("failed to send routing update: {}", err)),
+        },
+        CommandRequest::Quit | CommandRequest::Exit => {
+            json_error("terminating prismd via CLI is not supported".to_string())
         }
-        "clients" => match format_clients_response(device_id) {
-            Ok(output) => output,
-            Err(err) => format!("error: failed to fetch clients: {}\n", err),
-        },
-        "list" => match format_custom_properties_response(device_id) {
-            Ok(output) => output,
-            Err(err) => format!("error: failed to read custom properties: {}\n", err),
-        },
-        "quit" | "exit" => "error: terminating prismd via CLI is not supported\n".to_string(),
-        other => format!("error: unknown command '{}'; try 'help'\n", other),
     }
 }
 
-fn ipc_help_message() -> String {
-    "Commands:\n  set <PID> <OFFSET>  Send routing update\n  list                 Show driver custom properties\n  clients              Show active Prism clients\n".to_string()
-}
-
-fn format_clients_response(device_id: AudioObjectID) -> Result<String, String> {
+fn build_clients_payload(device_id: AudioObjectID) -> Result<Vec<ClientInfoPayload>, String> {
     let clients = fetch_client_list(device_id)?;
 
     {
@@ -214,51 +360,68 @@ fn format_clients_response(device_id: AudioObjectID) -> Result<String, String> {
         *cache = clients.clone();
     }
 
-    if clients.is_empty() {
-        Ok("No active Prism clients.\n".to_string())
-    } else {
-        let mut out = String::new();
-        out.push_str(&format!("Active Prism clients ({}):\n", clients.len()));
-        for entry in clients {
-            out.push_str(&format!(
-                "    pid={} client_id={} offset={}\n",
-                entry.pid, entry.client_id, entry.channel_offset
-            ));
-        }
-        Ok(out)
-    }
+    let payload = clients
+        .into_iter()
+        .map(|entry| ClientInfoPayload {
+            pid: entry.pid,
+            client_id: entry.client_id,
+            channel_offset: entry.channel_offset,
+            process_name: resolve_process_name(entry.pid),
+        })
+        .collect();
+
+    Ok(payload)
 }
 
-fn format_custom_properties_response(device_id: AudioObjectID) -> Result<String, String> {
+fn resolve_process_name(pid: i32) -> Option<String> {
+    if pid <= 0 {
+        return None;
+    }
+
+    const BUF_SIZE: usize = 4096;
+    let mut buffer = [0u8; BUF_SIZE];
+    let ret = unsafe {
+        libc::proc_pidpath(
+            pid,
+            buffer.as_mut_ptr() as *mut libc::c_void,
+            BUF_SIZE as u32,
+        )
+    };
+
+    if ret <= 0 {
+        return None;
+    }
+
+    let cstr = unsafe { CStr::from_ptr(buffer.as_ptr() as *const libc::c_char) };
+    let path = cstr.to_string_lossy();
+    let name = path
+        .rsplit('/')
+        .next()
+        .map(|segment| segment.to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| path.to_string());
+
+    Some(name)
+}
+
+fn build_custom_properties_payload(
+    device_id: AudioObjectID,
+) -> Result<Vec<CustomPropertyPayload>, String> {
     let entries = read_custom_property_info(device_id)?;
 
-    if entries.is_empty() {
-        return Ok("No custom properties reported by Prism driver.\n".to_string());
-    }
+    let payload = entries
+        .into_iter()
+        .map(|entry| CustomPropertyPayload {
+            selector: entry.selector,
+            property_data_type: entry.property_data_type,
+            qualifier_data_type: entry.qualifier_data_type,
+        })
+        .collect();
 
-    let mut out = String::new();
-    out.push_str(&format!("Custom properties for device {}:\n", device_id));
-
-    for (index, entry) in entries.iter().enumerate() {
-        let (selector_text, selector_hex) = format_fourcc(entry.selector);
-        let (type_text, type_hex) = format_fourcc(entry.property_data_type);
-        out.push_str(&format!(
-            "  [{}] selector='{}' (0x{:08X}) type='{}' (0x{:08X}) qualifier=0x{:08X}\n",
-            index, selector_text, selector_hex, type_text, type_hex, entry.qualifier_data_type
-        ));
-    }
-
-    Ok(out)
+    Ok(payload)
 }
 
-fn format_fourcc(value: u32) -> (String, u32) {
-    let text = fourcc_to_string_from_le(value);
-    let mut bytes = value.to_le_bytes();
-    bytes.reverse();
-    (text, u32::from_be_bytes(bytes))
-}
-
-fn main() {
+fn run_daemon() {
     println!("Prism Daemon (prismd) starting...");
 
     let device_id = match find_prism_device() {
