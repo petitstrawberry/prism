@@ -1,6 +1,13 @@
 # Prism – High-Fidelity macOS Virtual Audio Routing
 
-Prism is a high‑performance, fail‑secure virtual audio device for macOS that enables per‑application routing of audio streams. It consists of two main components: a lightweight Core Audio HAL driver (`Prism.driver`) written in Rust, and a user‑space daemon (`prismd`) that manages routing logic and configuration.
+Prism is a high‑performance, fail‑secure virtual audio device for macOS that enables per‑application routing of audio streams. 
+
+## Features
+
+- **Per-Application Routing**: Route audio from specific applications to designated channels.
+- **Fully customizable**: Configure routing rules dynamically via a command-line interface.
+- **Low Latency**: Designed for real-time audio processing with minimal delay.
+- **Robust Driver**: Built with Rust for safety and performance.
 
 ## Installation
 
