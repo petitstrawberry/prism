@@ -4,7 +4,7 @@ use coreaudio_sys::*;
 use plist::{Dictionary, Value};
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 // use std::collections::HashMap;
 // use std::sync::RwLock;
 
@@ -50,6 +50,7 @@ pub struct ClientSlot {
     pub client_id: AtomicU32,
     pub channel_offset: AtomicUsize,
     pub pid: AtomicI32,
+    pub last_write_time: AtomicU64,  // Per-channel timing tracking
 }
 
 fn encode_client_list(driver: &PrismDriver) -> Vec<u8> {
@@ -91,6 +92,10 @@ pub struct PrismDriver {
     pub phase: f64,
     pub loopback_buffer: Vec<f32>,
     pub config: PrismConfig,
+
+    // Timing synchronization (like BlackHole)
+    pub last_output_sample_time: AtomicU64,  // Tracks when data was last written
+    pub is_buffer_clear: AtomicBool,         // Tracks if buffer has valid data
 
     // Padding to prevent false sharing between write_pos and read_pos
     // Cache line size is typically 64 bytes.
@@ -663,12 +668,20 @@ unsafe extern "C" fn get_property_data_size(
                 || selector == kAudioDevicePropertySafetyOffset
                 || selector == kAudioDevicePropertyLatency
                 || selector == kAudioDevicePropertyDeviceIsAlive
-                || selector == kAudioDevicePropertyIsHidden
+                || selector == kAudioDevicePropertyNominalSampleRate
+                || selector == kAudioDevicePropertyAvailableNominalSampleRates
+                || selector == kAudioDevicePropertyBufferFrameSize
+                || selector == kAudioDevicePropertyBufferFrameSizeRange
+                || selector == kAudioDevicePropertyRingBufferFrameSize
                 || selector == kAudioDevicePropertyZeroTimeStampPeriod
+                || selector == kAudioDevicePropertyClockDomain
+                || selector == kAudioDevicePropertyClockSource
+                || selector == kAudioDevicePropertyDataSource
                 || selector == kAudioObjectPropertyScope
                 || selector == kAudioObjectPropertyElement
                 || selector == kAudioDevicePropertyBufferFrameSize
-                || selector == kAudioDevicePropertyRingBufferFrameSize
+                || selector == kAudioPrismPropertyRoutingTable
+                || selector == kAudioPrismPropertyClientList
             {
                 *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
             } else if selector == kAudioObjectPropertyManufacturer
@@ -1468,7 +1481,8 @@ unsafe extern "C" fn do_io_operation(
     let driver = _self as *mut PrismDriver;
     let loopback_buffer = &mut (*driver).loopback_buffer;
     let frames = _io_buffer_frame_size as usize;
-    let channels = (*driver).config.num_channels as usize; // device bus channels (64)
+    let channels = (*driver).config.num_channels as usize // device bus channels (64)
+    ;
     let buffer_len = loopback_buffer.len(); // Total samples in buffer
     let buffer_frames = buffer_len / channels; // Total frames in buffer
 
@@ -1478,55 +1492,51 @@ unsafe extern "C" fn do_io_operation(
     #[allow(unused_variables)]
     let cycle_info = &*_io_cycle_info;
 
-    if _operation_id == kAudioServerPlugInIOOperationWriteMix {
+    // Enforce expected direction:
+    //  - OUTPUT_STREAM_ID receives WriteMix (app playback into 64ch bus at a 2ch slot)
+    //  - INPUT_STREAM_ID serves ReadInput (64ch bus exposed to capture clients)
+    if _operation_id == kAudioServerPlugInIOOperationProcessOutput {
+        if _stream_id != OUTPUT_STREAM_ID {
+            return 0;
+        }
         if !_io_main_buffer.is_null() {
-            // Direct Indexing
             let idx = (_client_id as usize) & (MAX_CLIENTS - 1);
             let slots = &(*driver).client_slots;
             let slot = &slots[idx];
 
-            // Verify Client ID
             if slot.client_id.load(Ordering::Acquire) != _client_id {
                 return 0;
             }
+
             let channel_offset = slot.channel_offset.load(Ordering::Relaxed);
-
-            let input = _io_main_buffer as *const f32;
-            // Use mOutputTime to determine write position in ring buffer
-            // This ensures all clients writing to the same time slot write to the same buffer index
-            let sample_time = cycle_info.mOutputTime.mSampleTime as usize;
-            let w_pos = sample_time % buffer_frames;
-
-            // Calculate how many frames we can write before wrapping
-            let frames_until_wrap = buffer_frames - w_pos;
-            let input_channels = 2; // App writes 2ch (L/R) to device output
-
-            // Validate that the assigned channel range fits into the bus
-            if channel_offset + 1 >= channels {
+            if channel_offset < 2 || channel_offset + 1 >= channels {
                 return 0;
             }
 
+            let input = _io_main_buffer as *const f32;
+            let sample_time = cycle_info.mOutputTime.mSampleTime as usize;
+            let w_pos = sample_time % buffer_frames;
+            let frames_until_wrap = buffer_frames - w_pos;
+            let input_channels = 2;
+
             if frames <= frames_until_wrap {
-                // No wrapping needed
                 for i in 0..frames {
                     let in_l = *input.add(i * input_channels);
                     let in_r = *input.add(i * input_channels + 1);
-
                     let dst_idx = (w_pos + i) * channels + channel_offset;
                     if dst_idx + 1 < buffer_len {
-                        loopback_buffer[dst_idx] += in_l;
-                        loopback_buffer[dst_idx + 1] += in_r;
+                        loopback_buffer[dst_idx] = in_l;
+                        loopback_buffer[dst_idx + 1] = in_r;
                     }
                 }
             } else {
-                // Wrapping needed
                 for i in 0..frames_until_wrap {
                     let in_l = *input.add(i * input_channels);
                     let in_r = *input.add(i * input_channels + 1);
                     let dst_idx = (w_pos + i) * channels + channel_offset;
                     if dst_idx + 1 < buffer_len {
-                        loopback_buffer[dst_idx] += in_l;
-                        loopback_buffer[dst_idx + 1] += in_r;
+                        loopback_buffer[dst_idx] = in_l;
+                        loopback_buffer[dst_idx + 1] = in_r;
                     }
                 }
 
@@ -1537,57 +1547,177 @@ unsafe extern "C" fn do_io_operation(
                     let in_r = *input.add(src_idx * input_channels + 1);
                     let dst_idx = i * channels + channel_offset;
                     if dst_idx + 1 < buffer_len {
-                        loopback_buffer[dst_idx] += in_l;
-                        loopback_buffer[dst_idx + 1] += in_r;
+                        loopback_buffer[dst_idx] = in_l;
+                        loopback_buffer[dst_idx + 1] = in_r;
                     }
                 }
             }
+
+            let output_sample_time = cycle_info.mOutputTime.mSampleTime + (frames as f64);
+            slot.last_write_time.store(output_sample_time.to_bits(), Ordering::Release);
+            (*driver).is_buffer_clear.store(false, Ordering::Release);
+
+            if frames > 0 {
+                let first_frame_idx = w_pos * channels + channel_offset;
+                let sample_l = *input;
+                let sample_r = *input.add(1);
+                log_msg(&format!(
+                    "[ProcessOutput] client_id={} pid={} ch_offset={} w_pos={} output_time={:.0} data[0]={:.4} data[1]={:.4} abs_idx={} -> ch[{},{}]",
+                    _client_id,
+                    slot.pid.load(Ordering::Relaxed),
+                    channel_offset,
+                    w_pos,
+                    cycle_info.mOutputTime.mSampleTime,
+                    sample_l,
+                    sample_r,
+                    first_frame_idx,
+                    channel_offset,
+                    channel_offset + 1
+                ));
+            }
         }
-    } else if _operation_id == kAudioServerPlugInIOOperationReadInput && !_io_main_buffer.is_null()
-    {
-        let output = _io_main_buffer as *mut f32;
-        // Use mInputTime to determine read position
-        let sample_time = cycle_info.mInputTime.mSampleTime as usize;
-        let r_pos = sample_time % buffer_frames;
+    } else if _operation_id == kAudioServerPlugInIOOperationWriteMix {
+        if _stream_id != OUTPUT_STREAM_ID {
+            // Unexpected combination; ignore safely.
+            return 0;
+        }
+        if !_io_main_buffer.is_null() {
+            let input = _io_main_buffer as *const f32;
+            let sample_time = cycle_info.mOutputTime.mSampleTime as usize;
+            let w_pos = sample_time % buffer_frames;
+            let frames_until_wrap = buffer_frames - w_pos;
+            let input_channels = 2; // Treat mix as stereo system bus
 
-        // Calculate how many frames we can read before wrapping
-        let frames_until_wrap = buffer_frames - r_pos;
+            if frames <= frames_until_wrap {
+                // No wrapping needed
+                for i in 0..frames {
+                    let in_l = *input.add(i * input_channels);
+                    let in_r = *input.add(i * input_channels + 1);
 
-        if frames <= frames_until_wrap {
-            // No wrapping needed
-            let src_ptr = loopback_buffer.as_ptr().add(r_pos * channels);
-            let dst_ptr = output;
-            ptr::copy_nonoverlapping(src_ptr, dst_ptr, frames * channels);
+                    let dst_idx = (w_pos + i) * channels;
+                    if dst_idx + 1 < buffer_len {
+                        loopback_buffer[dst_idx] = in_l;
+                        loopback_buffer[dst_idx + 1] = in_r;
+                    }
+                }
+            } else {
+                // Wrapping needed
+                for i in 0..frames_until_wrap {
+                    let in_l = *input.add(i * input_channels);
+                    let in_r = *input.add(i * input_channels + 1);
+                    let dst_idx = (w_pos + i) * channels;
+                    if dst_idx + 1 < buffer_len {
+                        loopback_buffer[dst_idx] = in_l;
+                        loopback_buffer[dst_idx + 1] = in_r;
+                    }
+                }
 
-            // Destructive Read: Clear the buffer after reading to prevent old data from looping
-            // This is essential for OMNIBUS-style routing where channels might not be overwritten every cycle.
-            ptr::write_bytes(
-                loopback_buffer.as_mut_ptr().add(r_pos * channels),
-                0,
-                frames * channels,
-            );
-        } else {
-            // Wrapping needed
-            // 1. Read until end
-            let src_ptr1 = loopback_buffer.as_ptr().add(r_pos * channels);
-            let dst_ptr1 = output;
-            ptr::copy_nonoverlapping(src_ptr1, dst_ptr1, frames_until_wrap * channels);
+                let remainder = frames - frames_until_wrap;
+                for i in 0..remainder {
+                    let src_idx = frames_until_wrap + i;
+                    let in_l = *input.add(src_idx * input_channels);
+                    let in_r = *input.add(src_idx * input_channels + 1);
+                    let dst_idx = i * channels;
+                    if dst_idx + 1 < buffer_len {
+                        loopback_buffer[dst_idx] = in_l;
+                        loopback_buffer[dst_idx + 1] = in_r;
+                    }
+                }
+            }
 
-            // Clear part 1
-            ptr::write_bytes(
-                loopback_buffer.as_mut_ptr().add(r_pos * channels),
-                0,
-                frames_until_wrap * channels,
-            );
+            let output_sample_time = cycle_info.mOutputTime.mSampleTime + (frames as f64);
+            (*driver).last_output_sample_time.store(output_sample_time.to_bits(), Ordering::Release);
+            (*driver).is_buffer_clear.store(false, Ordering::Release);
 
-            // 2. Read remainder from start
-            let remainder = frames - frames_until_wrap;
-            let src_ptr2 = loopback_buffer.as_ptr(); // Start of buffer
-            let dst_ptr2 = output.add(frames_until_wrap * channels);
-            ptr::copy_nonoverlapping(src_ptr2, dst_ptr2, remainder * channels);
+            if frames > 0 {
+                let sample_l = *input;
+                let sample_r = *input.add(1);
+                log_msg(&format!(
+                    "[WriteMix] system_mix w_pos={} output_time={:.0} data[0]={:.4} data[1]={:.4}",
+                    w_pos,
+                    cycle_info.mOutputTime.mSampleTime,
+                    sample_l,
+                    sample_r
+                ));
+            }
+        }
+    } else if _operation_id == kAudioServerPlugInIOOperationReadInput {
+        if _stream_id != INPUT_STREAM_ID {
+            return 0;
+        }
+        if !_io_main_buffer.is_null() {
+            let output = _io_main_buffer as *mut f32;
+            let input_sample_time = cycle_info.mInputTime.mSampleTime;
+            let sample_time = input_sample_time as usize;
+            let r_pos = sample_time % buffer_frames;
+            let frames_until_wrap = buffer_frames - r_pos;
 
-            // Clear part 2
-            ptr::write_bytes(loopback_buffer.as_mut_ptr(), 0, remainder * channels);
+            // Log every ReadInput call (unconditionally)
+            let slots = &(*driver).client_slots;
+            let slot_idx = (_client_id as usize) & (MAX_CLIENTS - 1);
+            let slot = &slots[slot_idx];
+            let pid = slot.pid.load(Ordering::Relaxed);
+
+            // First, copy all channels from ring buffer to output
+            if frames <= frames_until_wrap {
+                let src_ptr = loopback_buffer.as_ptr().add(r_pos * channels);
+                let dst_ptr = output;
+                ptr::copy_nonoverlapping(src_ptr, dst_ptr, frames * channels);
+            } else {
+                let src_ptr1 = loopback_buffer.as_ptr().add(r_pos * channels);
+                let dst_ptr1 = output;
+                ptr::copy_nonoverlapping(src_ptr1, dst_ptr1, frames_until_wrap * channels);
+
+                let remainder = frames - frames_until_wrap;
+                let src_ptr2 = loopback_buffer.as_ptr();
+                let dst_ptr2 = output.add(frames_until_wrap * channels);
+                ptr::copy_nonoverlapping(src_ptr2, dst_ptr2, remainder * channels);
+            }
+
+            // Check timing for each channel pair and zero out stale data
+            // If we're trying to read data that hasn't been written yet, zero it out
+            for slot in slots.iter() {
+                let client_id = slot.client_id.load(Ordering::Acquire);
+                if client_id == 0 {
+                    continue;
+                }
+
+                let channel_offset = slot.channel_offset.load(Ordering::Relaxed);
+                if channel_offset < 2 || channel_offset + 1 >= channels {
+                    continue;
+                }
+
+                let last_write_bits = slot.last_write_time.load(Ordering::Acquire);
+                let last_write_time = f64::from_bits(last_write_bits);
+
+                // 可視化ログ: 毎回出力（頻度制限なし）
+                log_msg(&format!(
+                    "[TimingCheck] client_id={} ch_offset={} input_sample_time={:.0} last_write_time={:.0} frames={} delta={:.0}",
+                    client_id, channel_offset, input_sample_time, last_write_time, frames, (input_sample_time + (frames as f64)) - last_write_time
+                ));
+
+                // If we're reading data that hasn't been written yet, zero it out
+                if input_sample_time + (frames as f64) > last_write_time {
+                    for i in 0..frames {
+                        let dst_idx = i * channels + channel_offset;
+                        *output.add(dst_idx) = 0.0;
+                        *output.add(dst_idx + 1) = 0.0;
+                    }
+                }
+            }
+
+            // Debug: Log buffer info after timing check
+            static mut READ_COUNT: u32 = 0;
+            READ_COUNT += 1;
+            if READ_COUNT % 100 == 0 {
+                // Sample first few channels from the output buffer (after timing check)
+                let sample_ch0 = *output;
+                let sample_ch1 = *output.add(1);
+                let sample_ch2 = *output.add(2);
+                let sample_ch3 = *output.add(3);
+                log_msg(&format!("[ReadInput] client_id={} pid={} r_pos={} input_time={:.0} frames={} ch[0]={:.4} ch[1]={:.4} ch[2]={:.4} ch[3]={:.4}",
+                    _client_id, pid, r_pos, input_sample_time, frames, sample_ch0, sample_ch1, sample_ch2, sample_ch3));
+            }
         }
     }
     0
@@ -1674,6 +1804,7 @@ pub fn create_driver() -> *mut PrismDriver {
                     client_id: AtomicU32::new(0),
                     channel_offset: AtomicUsize::new(0),
                     pid: AtomicI32::new(0),
+                    last_write_time: AtomicU64::new(0),
                 });
             }
 
@@ -1688,6 +1819,8 @@ pub fn create_driver() -> *mut PrismDriver {
                 phase: 0.0,
                 loopback_buffer: vec![0.0; buffer_size],
                 config,
+                last_output_sample_time: AtomicU64::new(0),
+                is_buffer_clear: AtomicBool::new(true),
                 _pad1: [0; 64],
                 write_pos: AtomicUsize::new(0),
                 _pad2: [0; 64],
