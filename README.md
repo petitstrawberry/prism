@@ -11,7 +11,7 @@ Prism is a high‑performance, fail‑secure virtual audio device for macOS that
 
 ## Installation
 
-**Prerequisites:** macOS 13+, Xcode Command Line Tools, Rust.
+**Prerequisites:** Xcode Command Line Tools, Rust.
 
 ### 1. Build & Install Daemon and CLI Tool
 ```bash
