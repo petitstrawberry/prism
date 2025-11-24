@@ -1481,10 +1481,15 @@ unsafe extern "C" fn do_io_operation(
     let driver = _self as *mut PrismDriver;
     let loopback_buffer = &mut (*driver).loopback_buffer;
     let frames = _io_buffer_frame_size as usize;
-    let channels = (*driver).config.num_channels as usize // device bus channels (64)
-    ;
+    let channels = (*driver).config.num_channels as usize; // device bus channels (64)
     let buffer_len = loopback_buffer.len(); // Total samples in buffer
     let buffer_frames = buffer_len / channels; // Total frames in buffer
+
+    // ここで呼び出し状況を可視化
+    log_msg(&format!(
+        "[do_io_operation] operation_id={} stream_id={} client_id={}",
+        _operation_id, _stream_id, _client_id
+    ));
 
     if _io_cycle_info.is_null() {
         return kAudioHardwareIllegalOperationError as OSStatus;
@@ -1496,6 +1501,9 @@ unsafe extern "C" fn do_io_operation(
     //  - OUTPUT_STREAM_ID receives WriteMix (app playback into 64ch bus at a 2ch slot)
     //  - INPUT_STREAM_ID serves ReadInput (64ch bus exposed to capture clients)
     if _operation_id == kAudioServerPlugInIOOperationProcessOutput {
+
+        log_msg(&format!("[ProcessOutput] stream_id={}", _stream_id));
+
         if _stream_id != OUTPUT_STREAM_ID {
             return 0;
         }
@@ -1735,11 +1743,14 @@ unsafe extern "C" fn end_io_operation(
 
 // Helper for logging
 fn log_msg(msg: &str) {
-    use std::ffi::CString;
-    unsafe {
-        // syslog(LOG_USER, ...)
-        let c_msg = CString::new(msg).unwrap_or_else(|_| CString::new("prism: log error").unwrap());
-        libc::syslog(libc::LOG_USER | libc::LOG_INFO, c_msg.as_ptr());
+    #[cfg(debug_assertions)]
+    {
+        use std::ffi::CString;
+        unsafe {
+            // syslog(LOG_USER, ...)
+            let c_msg = CString::new(msg).unwrap_or_else(|_| CString::new("prism: log error").unwrap());
+            libc::syslog(libc::LOG_USER | libc::LOG_INFO, c_msg.as_ptr());
+        }
     }
 }
 
