@@ -6,7 +6,7 @@ Prism is a high‑performance, fail‑secure virtual audio device for macOS that
 
 **Prerequisites:** macOS 13+, Xcode Command Line Tools, Rust.
 
-### 1. Build & Install Daemon
+### 1. Build & Install Daemon and CLI Tool
 ```bash
 cargo install --path .
 ```
@@ -51,7 +51,7 @@ How routing updates work
 
 ## Uninstall
 
-## 1. Uninstall Deamon
+## 1. Uninstall Deamon and CLI tool
 
 ```bash
 # Remove the installed crate (package name: "prism")
