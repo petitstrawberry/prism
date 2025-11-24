@@ -1,56 +1,192 @@
 #[path = "../socket.rs"]
 mod socket;
 
+use clap::{Parser, Subcommand};
 use prism::ipc::{
-    ClientInfoPayload, CommandRequest, CustomPropertyPayload, HelpEntry, RoutingUpdateAck,
-    RpcResponse,
+    ClientInfoPayload, CommandRequest, CustomPropertyPayload, HelpEntry, RoutingUpdateAck, RpcResponse,
 };
 use serde::de::DeserializeOwned;
-use serde_json::{self, Value};
+use serde_json::{self};
 use std::collections::BTreeMap;
-use std::env;
-use std::io::{self, BufReader, Read, Write};
+// std::env not required here (clap handles args)
+use std::io::{BufReader, Read, Write};
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 
-fn main() {
-    let mut args: Vec<String> = env::args().skip(1).collect();
-    if args.is_empty() {
-        let _ = handle_help();
-        return;
-    }
+#[derive(Parser)]
+#[command(name = "prism", about = "Prism control CLI")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
 
-    let command = args.remove(0);
-    let result = match command.as_str() {
-        "set" => handle_set(args),
-        "list" => handle_list(),
-        "clients" => handle_clients(),
-        "repl" => run_repl(),
-        "help" | "--help" | "-h" => handle_help(),
-        other => {
-            eprintln!("Unknown command '{}'.", other);
-            display_help_entries(&fallback_help_entries());
-            Ok(())
-        }
+#[derive(Subcommand)]
+enum Commands {
+    /// Send routing update to a PID
+    #[command(about = "Send routing update to a PID")]
+    Set {
+        #[arg(value_name = "PID")]
+        pid: i32,
+        #[arg(value_name = "OFFSET|CH1-CH2")]
+        offset: String,
+    },
+    /// List driver custom properties
+    #[command(about = "List driver custom properties")]
+    List,
+    /// Show active Prism clients grouped by responsibility
+    #[command(about = "Show active Prism clients grouped by responsibility")]
+    Clients,
+    /// List apps grouped by responsible process
+    #[command(about = "List apps grouped by responsible process")]
+    Apps,
+    /// Set channel offset for all clients of an app
+    #[command(about = "Set channel offset for all clients of an app")]
+    SetApp {
+        #[arg(value_name = "APP_NAME")]
+        app_name: String,
+        #[arg(value_name = "OFFSET|CH1-CH2")]
+        offset: String,
+    },
+}
+
+fn main() {
+    let cli = Cli::parse();
+
+    let res = match cli.command {
+        Commands::Set { pid, offset } => handle_set(vec![pid.to_string(), offset]),
+        Commands::List => handle_list(),
+        Commands::Clients => handle_clients(),
+        Commands::Apps => handle_apps(Vec::new()),
+        Commands::SetApp { app_name, offset } => handle_set_app(vec![app_name, offset]),
     };
 
-    if let Err(err) = result {
+    if let Err(err) = res {
         eprintln!("prism: {}", err);
         std::process::exit(1);
     }
 }
 
+fn handle_apps(_args: Vec<String>) -> Result<(), String> {
+    // The apps command retrieves data via the Apps request
+    let response = send_request(&CommandRequest::Apps)?;
+    let parsed: RpcResponse<Vec<ClientInfoPayload>> = parse_response(&response)?;
+    let (_message, clients): (Option<String>, Vec<ClientInfoPayload>) = extract_success(parsed)?;
+
+    use std::collections::BTreeMap;
+    // Group by responsible process
+    let mut groups: BTreeMap<String, Vec<u32>> = BTreeMap::new();
+    let mut ungrouped: Vec<u32> = Vec::new();
+    for client in &clients {
+        if let Some(name) = client.responsible_name.as_ref().or(client.process_name.as_ref()) {
+            groups.entry(name.clone()).or_default().push(client.channel_offset);
+        } else {
+            ungrouped.push(client.channel_offset);
+        }
+    }
+
+    // Calculate the maximum app name width
+    let mut max_name_len = 10;
+    for name in groups.keys() {
+        if name.len() > max_name_len {
+            max_name_len = name.len();
+        }
+    }
+    // Header
+    println!("{:<width$} | {:>16}", "App", "Channels", width = max_name_len);
+    println!("{}-+-{}", "-".repeat(max_name_len), "-".repeat(16));
+    // Display groups
+    for (name, offsets) in groups.iter() {
+        let mut offsets = offsets.clone();
+        offsets.sort_unstable();
+        offsets.dedup();
+        let offset_str = offsets.iter()
+            .map(|o| {
+                let ch1 = o + 1;
+                let ch2 = o + 2;
+                format!("{}-{}ch", ch1, ch2)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{:<width$} | {:>16}", name, offset_str, width = max_name_len);
+    }
+    // Display ungrouped
+    if !ungrouped.is_empty() {
+        let mut offsets = ungrouped.clone();
+        offsets.sort_unstable();
+        offsets.dedup();
+        let offset_str = offsets.iter()
+            .map(|o| {
+                let ch1 = o * 2;
+                let ch2 = o * 2 + 1;
+                format!("{}-{}ch", ch1, ch2)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{:<width$} | {:>16}", "(Ungrouped)", offset_str, width = max_name_len);
+    }
+    Ok(())
+}
+
+fn handle_set_app(args: Vec<String>) -> Result<(), String> {
+    // set-app <APP_NAME> <OFFSET|CH1-CH2>
+    // Accept app name containing spaces by treating the last arg as the offset
+    if args.len() < 2 {
+        return Err("Usage: prism set-app <APP_NAME> <OFFSET|CH1-CH2>".to_string());
+    }
+    let offset_arg = args.last().unwrap().to_string();
+    let app_name = args[..args.len() - 1].join(" ");
+    // Accept either numeric offset or channel range like "1-2"
+    let offset: u32 = if let Some((ch1, ch2)) = parse_channel_range(&offset_arg) {
+        if ch2 != ch1 + 1 {
+            return Err("Channel range must be consecutive (e.g. 1-2, 3-4)".to_string());
+        }
+        if ch1 < 1 {
+            return Err("Channel numbers must be >= 1".to_string());
+        }
+        (ch1 - 1) as u32
+    } else {
+        offset_arg
+            .parse()
+            .map_err(|_| "OFFSET must be a non-negative integer or channel range (e.g. 1-2)".to_string())?
+    };
+    // Delegate the app-level update to prismd (daemon) and display its result.
+    let response = send_request(&CommandRequest::SetApp { app_name: app_name.clone(), offset })?;
+    let parsed: RpcResponse<Vec<RoutingUpdateAck>> = parse_response(&response)?;
+    let (_message, results): (Option<String>, Vec<RoutingUpdateAck>) = extract_success(parsed)?;
+
+    if results.is_empty() {
+        println!("No clients found for app '{}'.", app_name);
+    } else {
+        let pids: Vec<String> = results.iter().map(|ack| ack.pid.to_string()).collect();
+        println!("Set offset={} for app '{}' (pids: {})", offset, app_name, pids.join(", "));
+    }
+    Ok(())
+}
+
 fn handle_set(args: Vec<String>) -> Result<(), String> {
     if args.len() < 2 {
-        return Err("Usage: prism set <PID> <OFFSET>".to_string());
+        return Err("Usage: prism set <PID> <OFFSET|CH1-CH2>".to_string());
     }
 
     let pid: i32 = args[0]
         .parse()
         .map_err(|_| "PID must be an integer".to_string())?;
-    let offset: u32 = args[1]
-        .parse()
-        .map_err(|_| "OFFSET must be a non-negative integer".to_string())?;
+
+    // Accept either offset or CH1-CH2 format
+    let offset: u32 = if let Some((ch1, ch2)) = parse_channel_range(&args[1]) {
+        // offset = ch1 - 1
+        if ch2 != ch1 + 1 {
+            return Err("Channel range must be consecutive (e.g. 1-2, 2-3)".to_string());
+        }
+        if ch1 < 1 {
+            return Err("Channel numbers must be >= 1".to_string());
+        }
+        (ch1 - 1) as u32
+    } else {
+        args[1]
+            .parse()
+            .map_err(|_| "OFFSET must be a non-negative integer or channel range (e.g. 1-2)".to_string())?
+    };
     execute_set(pid, offset)
 }
 
@@ -60,96 +196,6 @@ fn handle_list() -> Result<(), String> {
 
 fn handle_clients() -> Result<(), String> {
     execute_clients()
-}
-fn handle_help() -> Result<(), String> {
-    match fetch_help_entries() {
-        Ok((message, entries)) => {
-            if let Some(msg) = message {
-                println!("{}", msg);
-            }
-            display_help_entries(&entries);
-        }
-        Err(err) => {
-            eprintln!("prism: {}", err);
-            display_help_entries(&fallback_help_entries());
-        }
-    }
-    Ok(())
-}
-
-fn run_repl() -> Result<(), String> {
-    println!("Prism control REPL (commands are routed via prismd). Type 'help' for commands.");
-    let stdin = io::stdin();
-    let mut stdout = io::stdout();
-
-    loop {
-        stdout
-            .write_all(b"> ")
-            .and_then(|_| stdout.flush())
-            .map_err(|err| err.to_string())?;
-
-        let mut line = String::new();
-        match stdin.read_line(&mut line) {
-            Ok(0) => break,
-            Ok(_) => {}
-            Err(err) => return Err(err.to_string()),
-        }
-
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
-
-        if line.eq_ignore_ascii_case("exit") || line.eq_ignore_ascii_case("quit") {
-            break;
-        }
-
-        if line.eq_ignore_ascii_case("help") {
-            if let Err(err) = execute_command(CommandRequest::Help) {
-                eprintln!("prism: {}", err);
-            }
-            continue;
-        }
-
-        if line.starts_with('{') {
-            match send_raw_payload(line) {
-                Ok(response) => print_response(&response),
-                Err(err) => eprintln!("prism: {}", err),
-            }
-            continue;
-        }
-
-        let tokens: Vec<&str> = line.split_whitespace().collect();
-        if tokens.is_empty() {
-            continue;
-        }
-
-        let request = match build_command_from_tokens(tokens[0], &tokens[1..]) {
-            Ok(req) => req,
-            Err(err) => {
-                eprintln!("prism: {}", err);
-                continue;
-            }
-        };
-
-        if let Err(err) = execute_command(request) {
-            eprintln!("prism: {}", err);
-        }
-    }
-
-    Ok(())
-}
-
-fn execute_command(request: CommandRequest) -> Result<(), String> {
-    match request {
-        CommandRequest::Set { pid, offset } => execute_set(pid, offset),
-        CommandRequest::List => execute_list(),
-        CommandRequest::Clients => execute_clients(),
-        CommandRequest::Help => handle_help(),
-        CommandRequest::Quit | CommandRequest::Exit => {
-            Err("terminating prismd via CLI is not supported".to_string())
-        }
-    }
 }
 
 fn execute_set(pid: i32, offset: u32) -> Result<(), String> {
@@ -283,43 +329,12 @@ fn execute_clients() -> Result<(), String> {
     Ok(())
 }
 
-fn build_command_from_tokens(command: &str, args: &[&str]) -> Result<CommandRequest, String> {
-    match command {
-        "set" => {
-            if args.len() < 2 {
-                return Err("usage: set <PID> <OFFSET>".to_string());
-            }
-            let pid = args[0]
-                .parse::<i32>()
-                .map_err(|_| "PID must be an integer".to_string())?;
-            let offset = args[1]
-                .parse::<u32>()
-                .map_err(|_| "OFFSET must be a non-negative integer".to_string())?;
-            Ok(CommandRequest::Set { pid, offset })
-        }
-        "list" => {
-            if !args.is_empty() {
-                return Err("list takes no arguments".to_string());
-            }
-            Ok(CommandRequest::List)
-        }
-        "clients" => {
-            if !args.is_empty() {
-                return Err("clients takes no arguments".to_string());
-            }
-            Ok(CommandRequest::Clients)
-        }
-        "help" => Ok(CommandRequest::Help),
-        other => Err(format!("unknown command '{}'; try 'help'", other)),
-    }
-}
-
+// Token-based command builder removed with REPL.
 fn send_request(request: &CommandRequest) -> Result<String, String> {
     let payload = serde_json::to_string(request)
         .map_err(|err| format!("failed to encode request: {}", err))?;
     send_raw_payload(&payload)
 }
-
 fn send_raw_payload(payload: &str) -> Result<String, String> {
     let mut stream = UnixStream::connect(socket::PRISM_SOCKET_PATH)
         .map_err(|err| format!("failed to connect to prismd: {}", err))?;
@@ -342,7 +357,6 @@ fn send_raw_payload(payload: &str) -> Result<String, String> {
 
     Ok(response)
 }
-
 fn fetch_help_entries() -> Result<(Option<String>, Vec<HelpEntry>), String> {
     let response = send_request(&CommandRequest::Help)?;
     let parsed: RpcResponse<Vec<HelpEntry>> = parse_response(&response)?;
@@ -352,12 +366,92 @@ fn fetch_help_entries() -> Result<(Option<String>, Vec<HelpEntry>), String> {
 fn display_help_entries(entries: &[HelpEntry]) {
     println!("Usage: prism <command> [args]\n");
     println!("Commands:");
-    for entry in entries {
-        println!(
-            "  {:<12} {:<22} {}",
-            entry.command, entry.usage, entry.description
-        );
+
+    // Determine column widths (but cap usage width)
+    let mut cmd_w = 6usize; // minimum
+    let mut usage_w = 12usize; // minimum
+    for e in entries {
+        if e.command.len() > cmd_w {
+            cmd_w = e.command.len();
+        }
+        if e.usage.len() > usage_w {
+            usage_w = e.usage.len();
+        }
     }
+    if usage_w > 36 {
+        usage_w = 36;
+    }
+
+    // Determine description wrap width based on terminal width (env COLUMNS) if available.
+    let term_width: usize = std::env::var("COLUMNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(80);
+
+    // Reserve space for command and usage columns and margins.
+    let reserved = cmd_w + usage_w + 6; // padding and separators
+    let mut desc_w = if term_width > reserved + 20 {
+        term_width - reserved
+    } else {
+        40usize
+    };
+    // Clamp desc width to reasonable bounds
+    if desc_w < 20 {
+        desc_w = 20;
+    } else if desc_w > 100 {
+        desc_w = 100;
+    }
+
+    for entry in entries {
+        // wrap description into lines
+        let desc = entry.description.trim();
+        let desc_lines = wrap_text(desc, desc_w);
+
+        // print first line with command and usage
+        let first_desc = desc_lines.get(0).map(|s| s.as_str()).unwrap_or("");
+        println!(
+            "  {usage:<usage_w$}  {desc}",
+            usage = entry.usage,
+            usage_w = usage_w,
+            desc = first_desc
+        );
+
+        // print continuation lines for description
+        for cont in desc_lines.iter().skip(1) {
+            println!(
+                "  {0:cmd_w$}  {1:usage_w$}  {cont}",
+                "",
+                "",
+                cont = cont,
+                cmd_w = cmd_w,
+                usage_w = usage_w
+            );
+        }
+    }
+}
+
+// Simple word-wrap: split on whitespace and build lines up to `width` characters.
+fn wrap_text(s: &str, width: usize) -> Vec<String> {
+    let mut lines: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for word in s.split_whitespace() {
+        if cur.is_empty() {
+            cur.push_str(word);
+        } else if cur.len() + 1 + word.len() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(cur);
+            cur = word.to_string();
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 fn fallback_help_entries() -> Vec<HelpEntry> {
@@ -366,30 +460,24 @@ fn fallback_help_entries() -> Vec<HelpEntry> {
         HelpEntry::new("clients", "clients", "Show active Prism clients via prismd"),
         HelpEntry::new(
             "set",
-            "set <PID> <OFFSET>",
-            "Send routing update (relayed by prismd)",
+            "set <PID> <OFFSET|CH1-CH2>",
+            "Send routing update (relayed by prismd). OFFSET or CH1-CH2 are accepted.",
         ),
         HelpEntry::new(
-            "repl",
-            "repl",
-            "Start interactive shell (commands go to prismd)",
+            "apps",
+            "apps",
+            "List active apps grouped by responsible process (shows channel ranges)",
         ),
+        HelpEntry::new(
+            "set-app",
+            "set-app <APP_NAME> <OFFSET|CH1-CH2>",
+            "Request prismd to set channel offset for all clients of APP_NAME",
+        ),
+        // repl removed; use subcommands instead
         HelpEntry::new("help", "help", "Show this help message"),
     ]
 }
 
-fn print_response(raw: &str) {
-    match serde_json::from_str::<Value>(raw) {
-        Ok(value) => {
-            let pretty = serde_json::to_string_pretty(&value).unwrap_or_else(|_| raw.to_string());
-            println!("{}", pretty);
-        }
-        Err(err) => {
-            eprintln!("prism: invalid JSON response: {}", err);
-            println!("{}", raw);
-        }
-    }
-}
 
 fn parse_response<T>(raw: &str) -> Result<RpcResponse<T>, String>
 where
@@ -425,4 +513,15 @@ fn format_fourcc(value: u32) -> (String, u32) {
         })
         .collect();
     (text, u32::from_be_bytes(bytes))
+}
+
+// Parse "1-2" or "2-3" style channel range, return (ch1, ch2) if valid, else None
+fn parse_channel_range(s: &str) -> Option<(u32, u32)> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() == 2 {
+        if let (Ok(ch1), Ok(ch2)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>()) {
+            return Some((ch1, ch2));
+        }
+    }
+    None
 }

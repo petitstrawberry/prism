@@ -11,6 +11,11 @@ pub enum CommandRequest {
         #[serde(alias = "channel_offset")]
         offset: u32,
     },
+    Apps,
+    SetApp {
+        app_name: String,
+        offset: u32,
+    },
     Quit,
     Exit,
 }

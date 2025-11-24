@@ -11,13 +11,12 @@ use host::{
     fetch_client_list, find_prism_device, read_custom_property_info, send_rout_update, ClientEntry,
     K_AUDIO_PRISM_PROPERTY_CLIENT_LIST,
 };
-use prism::ipc::{
-    ClientInfoPayload, CommandRequest, CustomPropertyPayload, HelpEntry, RoutingUpdateAck,
-    RpcResponse,
-};
+use prism::ipc::{ClientInfoPayload, CommandRequest, CustomPropertyPayload, RoutingUpdateAck, RpcResponse};
 use prism::process as procinfo;
 use serde::Serialize;
+use std::collections::HashSet;
 use std::env;
+use clap::Parser;
 use std::ffi::c_void;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
@@ -28,10 +27,19 @@ use std::sync::Mutex;
 use std::thread;
 use std::time::Duration;
 
-struct CliOptions {
+#[derive(Parser)]
+#[command(name = "prismd", about = "Prism daemon controller")]
+struct Opts {
+    /// Run as a background process
+    #[arg(short = 'd', long = "daemonize")]
     daemonize: bool,
+
+    /// Internal flag used by the daemon child
+    #[arg(long = "daemon-child")]
     daemon_child: bool,
-    show_help: bool,
+
+    /// Forward unknown args (collected)
+    #[arg(last = true)]
     forward_args: Vec<String>,
 }
 
@@ -75,51 +83,9 @@ fn json_error(message: String) -> String {
     json_response::<serde_json::Value>("error", Some(message), None)
 }
 
-fn help_payload() -> Vec<HelpEntry> {
-    vec![
-        HelpEntry::new(
-            "set",
-            "set <PID> <OFFSET>",
-            "Send a routing update to map PID to channel offset",
-        ),
-        HelpEntry::new(
-            "list",
-            "list",
-            "List custom driver properties exposed by Prism",
-        ),
-        HelpEntry::new(
-            "clients",
-            "clients",
-            "Show active Prism clients with routing offsets",
-        ),
-    ]
-}
+// daemon no longer provides a help payload; CLI serves local help.
 
-fn parse_cli_options() -> CliOptions {
-    let mut options = CliOptions {
-        daemonize: false,
-        daemon_child: false,
-        show_help: false,
-        forward_args: Vec::new(),
-    };
-
-    for arg in env::args().skip(1) {
-        match arg.as_str() {
-            "--daemonize" | "-d" => options.daemonize = true,
-            "--daemon-child" => options.daemon_child = true,
-            "--help" | "-h" => options.show_help = true,
-            _ => options.forward_args.push(arg),
-        }
-    }
-
-    options
-}
-
-fn print_usage() {
-    println!(
-        "Usage: prismd [OPTIONS]\n\nOptions:\n  -d, --daemonize    Run as a background process\n  -h, --help         Show this help message"
-    );
-}
+// clap handles parsing and help printing for prismd
 
 fn spawn_daemon_child(args: &[String]) -> Result<u32, String> {
     let exe = env::current_exe().map_err(|err| err.to_string())?;
@@ -140,20 +106,15 @@ fn spawn_daemon_child(args: &[String]) -> Result<u32, String> {
 }
 
 fn main() {
-    let options = parse_cli_options();
+    let opts = Opts::parse();
 
-    if options.daemon_child {
+    if opts.daemon_child {
         run_daemon();
         return;
     }
 
-    if options.show_help {
-        print_usage();
-        return;
-    }
-
-    if options.daemonize {
-        match spawn_daemon_child(&options.forward_args) {
+    if opts.daemonize {
+        match spawn_daemon_child(&opts.forward_args) {
             Ok(pid) => {
                 println!("prismd started in background (pid={})", pid);
                 return;
@@ -165,10 +126,10 @@ fn main() {
         }
     }
 
-    if !options.forward_args.is_empty() {
+    if !opts.forward_args.is_empty() {
         eprintln!(
             "[prismd] Unknown arguments: {}",
-            options.forward_args.join(" ")
+            opts.forward_args.join(" ")
         );
         process::exit(2);
     }
@@ -350,7 +311,7 @@ fn handle_ipc_command(raw: &str, device_id: AudioObjectID) -> String {
     };
 
     match request {
-        CommandRequest::Help => json_success_with_data(help_payload()),
+        CommandRequest::Help => json_error("help is provided by the CLI; run 'prism --help' locally".to_string()),
         CommandRequest::Clients => match build_clients_payload(device_id) {
             Ok(payload) => json_success_with_data(payload),
             Err(err) => json_error(format!("failed to fetch clients: {}", err)),
@@ -369,6 +330,73 @@ fn handle_ipc_command(raw: &str, device_id: AudioObjectID) -> String {
             ),
             Err(err) => json_error(format!("failed to send routing update: {}", err)),
         },
+        CommandRequest::Apps => match build_clients_payload(device_id) {
+            Ok(payload) => json_success_with_data(payload),
+            Err(err) => json_error(format!("failed to fetch apps: {}", err)),
+        },
+        CommandRequest::SetApp { app_name, offset } => {
+            // Find groups by the display name used by the `apps` command
+            // (responsible_name if present, otherwise process_name). Match must be exact.
+            match build_clients_payload(device_id) {
+                Ok(clients) => {
+                    // Collect target responsible_pids (groups) and individual pids where responsible_pid is None
+                    let mut target_responsible_pids: HashSet<i32> = HashSet::new();
+                    let mut direct_pids: Vec<i32> = Vec::new();
+                    for client in &clients {
+                        let display = client
+                            .responsible_name
+                            .as_ref()
+                            .or(client.process_name.as_ref())
+                            .map(|s| s.as_str());
+                        if display == Some(app_name.as_str()) {
+                            if let Some(rpid) = client.responsible_pid {
+                                target_responsible_pids.insert(rpid);
+                            } else {
+                                direct_pids.push(client.pid);
+                            }
+                        }
+                    }
+
+                    if target_responsible_pids.is_empty() && direct_pids.is_empty() {
+                        return json_error(format!("no clients found for app '{}'.", app_name));
+                    }
+
+                    let mut results: Vec<RoutingUpdateAck> = Vec::new();
+                    let mut errors: Vec<String> = Vec::new();
+
+                    for client in clients {
+                        let should_update = if let Some(rpid) = client.responsible_pid {
+                            target_responsible_pids.contains(&rpid)
+                        } else {
+                            direct_pids.contains(&client.pid)
+                        };
+
+                        if should_update {
+                            match send_rout_update(device_id, client.pid, offset) {
+                                Ok(()) => results.push(RoutingUpdateAck { pid: client.pid, channel_offset: offset }),
+                                Err(err) => errors.push(format!("failed to set pid {}: {}", client.pid, err)),
+                            }
+                        }
+                    }
+
+                    if results.is_empty() {
+                        if errors.is_empty() {
+                            return json_error(format!("no clients found for app '{}'.", app_name));
+                        } else {
+                            return json_error(format!("all matching clients failed for app '{}': {}", app_name, errors.join("; ")));
+                        }
+                    }
+
+                    if !errors.is_empty() {
+                        let msg = format!("partial failures: {}", errors.join("; "));
+                        return json_success_with_message_and_data(msg, results);
+                    }
+
+                    json_success_with_data(results)
+                }
+                Err(err) => json_error(format!("failed to fetch clients: {}", err)),
+            }
+        }
         CommandRequest::Quit | CommandRequest::Exit => {
             json_error("terminating prismd via CLI is not supported".to_string())
         }
