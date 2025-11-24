@@ -15,9 +15,10 @@ use prism::ipc::{
     ClientInfoPayload, CommandRequest, CustomPropertyPayload, HelpEntry, RoutingUpdateAck,
     RpcResponse,
 };
+use prism::process as procinfo;
 use serde::Serialize;
 use std::env;
-use std::ffi::{c_void, CStr};
+use std::ffi::c_void;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::fs::PermissionsExt;
@@ -208,11 +209,33 @@ fn handle_client_list_update(device_id: AudioObjectID) -> Result<(), String> {
     println!("[prismd] Client list updated ({} entries)", clients.len());
     for entry in &clients {
         let process_name =
-            resolve_process_name(entry.pid).unwrap_or_else(|| "<unknown>".to_string());
-        println!(
-            "    pid={} ({}) client_id={} offset={}",
-            entry.pid, process_name, entry.client_id, entry.channel_offset
-        );
+            procinfo::process_name(entry.pid).unwrap_or_else(|| "<unknown>".to_string());
+        if let Some(identity) = procinfo::resolve_responsible_identity(entry.pid) {
+            let responsible_name = identity
+                .preferred_name()
+                .unwrap_or_else(|| "<unknown>".to_string());
+            if identity.pid != entry.pid {
+                println!(
+                    "    pid={} ({}) client_id={} offset={} -> responsible pid={} ({})",
+                    entry.pid,
+                    process_name,
+                    entry.client_id,
+                    entry.channel_offset,
+                    identity.pid,
+                    responsible_name
+                );
+            } else {
+                println!(
+                    "    pid={} ({}) client_id={} offset={}",
+                    entry.pid, process_name, entry.client_id, entry.channel_offset
+                );
+            }
+        } else {
+            println!(
+                "    pid={} ({}) client_id={} offset={}",
+                entry.pid, process_name, entry.client_id, entry.channel_offset
+            );
+        }
     }
 
     Ok(())
@@ -362,46 +385,28 @@ fn build_clients_payload(device_id: AudioObjectID) -> Result<Vec<ClientInfoPaylo
 
     let payload = clients
         .into_iter()
-        .map(|entry| ClientInfoPayload {
-            pid: entry.pid,
-            client_id: entry.client_id,
-            channel_offset: entry.channel_offset,
-            process_name: resolve_process_name(entry.pid),
+        .map(|entry| {
+            let process_name = procinfo::process_name(entry.pid);
+            let responsible_identity = procinfo::resolve_responsible_identity(entry.pid);
+            let (responsible_pid, responsible_name) = if let Some(identity) = responsible_identity {
+                let name = identity.preferred_name();
+                (Some(identity.pid), name)
+            } else {
+                (None, None)
+            };
+
+            ClientInfoPayload {
+                pid: entry.pid,
+                client_id: entry.client_id,
+                channel_offset: entry.channel_offset,
+                process_name,
+                responsible_pid,
+                responsible_name,
+            }
         })
         .collect();
 
     Ok(payload)
-}
-
-fn resolve_process_name(pid: i32) -> Option<String> {
-    if pid <= 0 {
-        return None;
-    }
-
-    const BUF_SIZE: usize = 4096;
-    let mut buffer = [0u8; BUF_SIZE];
-    let ret = unsafe {
-        libc::proc_pidpath(
-            pid,
-            buffer.as_mut_ptr() as *mut libc::c_void,
-            BUF_SIZE as u32,
-        )
-    };
-
-    if ret <= 0 {
-        return None;
-    }
-
-    let cstr = unsafe { CStr::from_ptr(buffer.as_ptr() as *const libc::c_char) };
-    let path = cstr.to_string_lossy();
-    let name = path
-        .rsplit('/')
-        .next()
-        .map(|segment| segment.to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| path.to_string());
-
-    Some(name)
 }
 
 fn build_custom_properties_payload(

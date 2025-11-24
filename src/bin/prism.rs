@@ -7,6 +7,7 @@ use prism::ipc::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{self, Value};
+use std::collections::BTreeMap;
 use std::env;
 use std::io::{self, BufReader, Read, Write};
 use std::net::Shutdown;
@@ -206,13 +207,78 @@ fn execute_clients() -> Result<(), String> {
         return Ok(());
     }
 
-    println!("Active Prism clients ({}):", clients.len());
+    let mut groups: BTreeMap<i32, (Option<String>, Vec<ClientInfoPayload>)> = BTreeMap::new();
+    let mut ungrouped: Vec<ClientInfoPayload> = Vec::new();
+
     for entry in clients {
-        let name = entry.process_name.as_deref().unwrap_or("<unknown>");
+        if let Some(pid) = entry.responsible_pid {
+            let display_name = entry
+                .responsible_name
+                .clone()
+                .or_else(|| entry.process_name.clone());
+            let group = groups
+                .entry(pid)
+                .or_insert_with(|| (display_name.clone(), Vec::new()));
+            if group.0.is_none() && display_name.is_some() {
+                group.0 = display_name.clone();
+            }
+            group.1.push(entry);
+        } else {
+            ungrouped.push(entry);
+        }
+    }
+
+    let total_clients: usize = groups
+        .values()
+        .map(|(_, members)| members.len())
+        .sum::<usize>()
+        + ungrouped.len();
+
+    println!(
+        "Active Prism clients grouped by responsibility ({} client{})",
+        total_clients,
+        if total_clients == 1 { "" } else { "s" }
+    );
+
+    for (pid, (name, members)) in groups.iter_mut() {
+        members.sort_by(|a, b| a.pid.cmp(&b.pid).then(a.client_id.cmp(&b.client_id)));
+        let display_name = name.as_deref().unwrap_or("<unknown>");
         println!(
-            "    pid={} ({}) client_id={} offset={}",
-            entry.pid, name, entry.client_id, entry.channel_offset
+            "  Responsible pid={} ({}) [{} member{}]",
+            pid,
+            display_name,
+            members.len(),
+            if members.len() == 1 { "" } else { "s" }
         );
+
+        for client in members {
+            let proc_name = client.process_name.as_deref().unwrap_or("<unknown>");
+            let marker = if Some(*pid) == client.responsible_pid && client.pid == *pid {
+                "*"
+            } else {
+                "-"
+            };
+            println!(
+                "    {} pid={} ({}) client_id={} offset={}",
+                marker, client.pid, proc_name, client.client_id, client.channel_offset
+            );
+        }
+    }
+
+    if !ungrouped.is_empty() {
+        ungrouped.sort_by(|a, b| a.pid.cmp(&b.pid).then(a.client_id.cmp(&b.client_id)));
+        println!("  Ungrouped clients ({}):", ungrouped.len());
+        for client in ungrouped {
+            let proc_name = client.process_name.as_deref().unwrap_or("<unknown>");
+            println!(
+                "    - pid={} ({}) client_id={} offset={}",
+                client.pid, proc_name, client.client_id, client.channel_offset
+            );
+        }
+    }
+
+    if !groups.is_empty() {
+        println!("  ('*' marks the responsible process owning the group)");
     }
     Ok(())
 }

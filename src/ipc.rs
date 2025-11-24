@@ -31,6 +31,10 @@ pub struct ClientInfoPayload {
     pub channel_offset: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub process_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responsible_pid: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub responsible_name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
