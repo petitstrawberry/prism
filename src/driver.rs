@@ -494,7 +494,13 @@ unsafe extern "C" fn has_property(
                selector == kAudioStreamPropertyTerminalType ||
                selector == kAudioStreamPropertyStartingChannel ||
                selector == kAudioObjectPropertyScope ||
-               selector == kAudioObjectPropertyElement
+               selector == kAudioObjectPropertyElement ||
+               // stream formats
+               selector == kAudioStreamPropertyVirtualFormat ||
+               selector == kAudioStreamPropertyPhysicalFormat ||
+               selector == kAudioStreamPropertyPhysicalFormats ||
+               selector == kAudioStreamPropertyAvailableVirtualFormats ||
+               selector == kAudioStreamPropertyAvailablePhysicalFormats
             {
                 log_msg(&format!(
                     "Prism: HasProperty Stream Known. Object: {}, Selector: {}",
@@ -1150,14 +1156,15 @@ unsafe extern "C" fn get_property_data(
                 }
                 kAudioStreamPropertyVirtualFormat | kAudioStreamPropertyPhysicalFormat => {
                     let out = _out_data as *mut AudioStreamBasicDescription;
+                    let channels_per_frame: u32 = if object_id == OUTPUT_STREAM_ID { 2 } else { (*driver).config.num_channels };
                     *out = AudioStreamBasicDescription {
                         mSampleRate: 48000.0,
                         mFormatID: kAudioFormatLinearPCM,
                         mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-                        mBytesPerPacket: 4 * (*driver).config.num_channels,
+                        mBytesPerPacket: 4 * channels_per_frame,
                         mFramesPerPacket: 1,
-                        mBytesPerFrame: 4 * (*driver).config.num_channels,
-                        mChannelsPerFrame: (*driver).config.num_channels,
+                        mBytesPerFrame: 4 * channels_per_frame,
+                        mChannelsPerFrame: channels_per_frame,
                         mBitsPerChannel: 32,
                         mReserved: 0,
                     };
@@ -1167,22 +1174,20 @@ unsafe extern "C" fn get_property_data(
                 | kAudioStreamPropertyAvailableVirtualFormats
                 | kAudioStreamPropertyAvailablePhysicalFormats => {
                     let out = _out_data as *mut AudioStreamRangedDescription;
+                    let channels_per_frame: u32 = if object_id == OUTPUT_STREAM_ID { 2 } else { (*driver).config.num_channels };
                     *out = AudioStreamRangedDescription {
                         mFormat: AudioStreamBasicDescription {
                             mSampleRate: 48000.0,
                             mFormatID: kAudioFormatLinearPCM,
                             mFormatFlags: kAudioFormatFlagIsFloat | kAudioFormatFlagIsPacked,
-                            mBytesPerPacket: 4 * (*driver).config.num_channels,
+                            mBytesPerPacket: 4 * channels_per_frame,
                             mFramesPerPacket: 1,
-                            mBytesPerFrame: 4 * (*driver).config.num_channels,
-                            mChannelsPerFrame: (*driver).config.num_channels,
+                            mBytesPerFrame: 4 * channels_per_frame,
+                            mChannelsPerFrame: channels_per_frame,
                             mBitsPerChannel: 32,
                             mReserved: 0,
                         },
-                        mSampleRateRange: AudioValueRange {
-                            mMinimum: 48000.0,
-                            mMaximum: 48000.0,
-                        },
+                        mSampleRateRange: AudioValueRange { mMinimum: 48000.0, mMaximum: 48000.0 },
                     };
                     *_out_data_size = std::mem::size_of::<AudioStreamRangedDescription>() as UInt32;
                 }
@@ -1262,6 +1267,16 @@ unsafe extern "C" fn set_property_data(
 
         let driver_ref = &*driver;
         let slots = &driver_ref.client_slots;
+
+        // Validate offset for 2ch write into 64ch bus
+        let max_channels = (*driver).config.num_channels;
+        if offset % 2 != 0 || offset + 1 >= max_channels {
+            log_msg(&format!(
+                "Prism: ROUT rejected: invalid channel_offset={}, max_channels={}",
+                offset, max_channels
+            ));
+            return kAudioHardwareIllegalOperationError as OSStatus;
+        }
 
         // pid == -1 => broadcast to all clients
         if pid == -1 {
@@ -1453,7 +1468,7 @@ unsafe extern "C" fn do_io_operation(
     let driver = _self as *mut PrismDriver;
     let loopback_buffer = &mut (*driver).loopback_buffer;
     let frames = _io_buffer_frame_size as usize;
-    let channels = (*driver).config.num_channels as usize;
+    let channels = (*driver).config.num_channels as usize; // device bus channels (64)
     let buffer_len = loopback_buffer.len(); // Total samples in buffer
     let buffer_frames = buffer_len / channels; // Total frames in buffer
 
@@ -1484,7 +1499,12 @@ unsafe extern "C" fn do_io_operation(
 
             // Calculate how many frames we can write before wrapping
             let frames_until_wrap = buffer_frames - w_pos;
-            let input_channels = channels; // The buffer is 16ch interleaved
+            let input_channels = 2; // App writes 2ch (L/R) to device output
+
+            // Validate that the assigned channel range fits into the bus
+            if channel_offset + 1 >= channels {
+                return 0;
+            }
 
             if frames <= frames_until_wrap {
                 // No wrapping needed
