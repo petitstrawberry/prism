@@ -78,11 +78,11 @@ Use `prism --help` to discover additional subcommands.
 
 ### Mixing model
 
-- The capture side exposes all 64 channels. Channels 1/2 always carry the system mix written by `WriteMix`.
-- Each registered client owns a dedicated stereo slot buffer sized to `buffer_frame_size` (1024 frames by default).
-- During `ReadInput`, Prism zeroes the capture buffer and sums the system mix with any slots whose most recent write covers the current IO cycle. This guarantees freshly-written audio only.
-- Slot buffers are preallocated (4096 slots × 1024 frames × stereo ≈ 32 MB) so no heap work happens in the realtime path.
-- Accelerate’s `vDSP_vclr` and `vDSP_vadd` handle zeroing and accumulation, keeping the hot loop vectorized.
+- Channels 1/2 always carry the same full-system mix you hear through your speakers.
+- Every pinned app gets its own stereo pair on the 64-channel bus, so you can record or stream it separately.
+- Reroute apps on the fly without pops or stale audio—the mix updates instantly every cycle.
+- Tuned for live workflows, keeping latency low even when lots of apps are active.
+- Apple’s Accelerate framework (vDSP) handles the math under the hood, keeping CPU use light.
 
 ## Uninstall
 
