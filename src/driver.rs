@@ -1989,14 +1989,14 @@ unsafe extern "C" fn end_io_operation(
 }
 
 // Helper for logging
-fn log_msg(msg: &str) {
+fn log_msg(_msg: &str) {
     #[cfg(debug_assertions)]
     {
         use std::ffi::CString;
         unsafe {
             // syslog(LOG_USER, ...)
             let c_msg =
-                CString::new(msg).unwrap_or_else(|_| CString::new("prism: log error").unwrap());
+                CString::new(_msg).unwrap_or_else(|_| CString::new("prism: log error").unwrap());
             libc::syslog(libc::LOG_USER | libc::LOG_INFO, c_msg.as_ptr());
         }
     }
