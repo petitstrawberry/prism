@@ -5,6 +5,44 @@ use plist::{Dictionary, Value};
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+
+mod accelerate {
+    #[link(name = "Accelerate", kind = "framework")]
+    extern "C" {
+        fn vDSP_vclr(dst: *mut f32, stride_dst: isize, len: usize);
+        fn vDSP_vadd(
+            a: *const f32,
+            stride_a: isize,
+            b: *const f32,
+            stride_b: isize,
+            c: *mut f32,
+            stride_c: isize,
+            len: usize,
+        );
+    }
+
+    #[inline]
+    pub unsafe fn clear(dst: *mut f32, len: usize) {
+        if len == 0 {
+            return;
+        }
+        vDSP_vclr(dst, 1, len);
+    }
+
+    #[inline]
+    pub unsafe fn add_inplace(
+        src: *const f32,
+        stride_src: isize,
+        dst: *mut f32,
+        stride_dst: isize,
+        frames: usize,
+    ) {
+        if frames == 0 {
+            return;
+        }
+        vDSP_vadd(src, stride_src, dst, stride_dst, dst, stride_dst, frames);
+    }
+}
 // use std::collections::HashMap;
 // use std::sync::RwLock;
 
@@ -51,6 +89,10 @@ pub struct ClientSlot {
     pub channel_offset: AtomicUsize,
     pub pid: AtomicI32,
     pub last_write_time: AtomicU64,  // Per-channel timing tracking
+    pub slot_active: AtomicBool,
+    // Per-slot small ring buffer for stereo frames (length = buffer_frame_size * 2)
+    // Preallocated at driver creation to avoid allocs in IO path.
+    pub slot_buffer: Vec<f32>,
 }
 
 fn encode_client_list(driver: &PrismDriver) -> Vec<u8> {
@@ -307,6 +349,21 @@ unsafe extern "C" fn remove_device_client(
         let id = slot.client_id.load(Ordering::SeqCst);
 
         if id == client_id {
+            // Before clearing the slot, zero any stale audio left in the slot buffer
+            let prev_offset = slot.channel_offset.load(Ordering::Acquire);
+            // Zero per-slot buffer
+            {
+                let slots_ref = &(*driver).client_slots;
+                let idx = (client_id as usize) & (MAX_CLIENTS - 1);
+                let buf_ptr = slots_ref[idx].slot_buffer.as_ptr() as *mut f32;
+                let buf_len = slots_ref[idx].slot_buffer.len();
+                for i in 0..buf_len {
+                    unsafe { std::ptr::write(buf_ptr.add(i), 0.0); }
+                }
+            }
+            // Also zero the ring pair if necessary
+            zero_channel_pair(driver, prev_offset);
+
             slot.client_id.store(0, Ordering::Release); // Reset to 0
             slot.channel_offset.store(0, Ordering::Relaxed);
             slot.pid.store(0, Ordering::Relaxed);
@@ -1295,8 +1352,10 @@ unsafe extern "C" fn set_property_data(
         if pid == -1 {
             for j in 0..MAX_CLIENTS {
                 let slot = &slots[j];
-                slot.channel_offset
-                    .store(offset as usize, Ordering::Release);
+                let prev = slot.channel_offset.swap(offset as usize, Ordering::AcqRel);
+                if prev != offset as usize {
+                    zero_channel_pair(driver, prev);
+                }
             }
             log_msg(&format!(
                 "Prism: Routing Update ROUT Broadcast. Offset={}",
@@ -1311,8 +1370,10 @@ unsafe extern "C" fn set_property_data(
             for j in 0..MAX_CLIENTS {
                 let slot = &slots[j];
                 if slot.pid.load(Ordering::Acquire) == pid {
-                    slot.channel_offset
-                        .store(offset as usize, Ordering::Release);
+                    let prev = slot.channel_offset.swap(offset as usize, Ordering::AcqRel);
+                    if prev != offset as usize {
+                        zero_channel_pair(driver, prev);
+                    }
                     log_msg(&format!(
                         "Prism: Routing Update via ROUT. PID={}, Offset={}",
                         pid, offset
@@ -1521,67 +1582,42 @@ unsafe extern "C" fn do_io_operation(
                 return 0;
             }
 
-            let input = _io_main_buffer as *const f32;
-            let sample_time = cycle_info.mOutputTime.mSampleTime as usize;
-            let w_pos = sample_time % buffer_frames;
-            let frames_until_wrap = buffer_frames - w_pos;
-            let input_channels = 2;
+            // Write into the per-slot buffer (stereo: left/right interleaved)
+            if !_io_main_buffer.is_null() {
+                let input = _io_main_buffer as *const f32;
+                let input_channels = 2;
+                let slots_ref = &(*driver).client_slots;
+                let idx = (_client_id as usize) & (MAX_CLIENTS - 1);
+                let slot_buf_ptr = slots_ref[idx].slot_buffer.as_ptr() as *mut f32;
 
-            if frames <= frames_until_wrap {
+                // Write sequentially into slot buffer for this IO cycle (0..frames-1)
                 for i in 0..frames {
                     let in_l = *input.add(i * input_channels);
                     let in_r = *input.add(i * input_channels + 1);
-                    let dst_idx = (w_pos + i) * channels + channel_offset;
-                    if dst_idx + 1 < buffer_len {
-                        loopback_buffer[dst_idx] = in_l;
-                        loopback_buffer[dst_idx + 1] = in_r;
-                    }
-                }
-            } else {
-                for i in 0..frames_until_wrap {
-                    let in_l = *input.add(i * input_channels);
-                    let in_r = *input.add(i * input_channels + 1);
-                    let dst_idx = (w_pos + i) * channels + channel_offset;
-                    if dst_idx + 1 < buffer_len {
-                        loopback_buffer[dst_idx] = in_l;
-                        loopback_buffer[dst_idx + 1] = in_r;
+                    let dst = i * 2;
+                    unsafe {
+                        std::ptr::write(slot_buf_ptr.add(dst), in_l);
+                        std::ptr::write(slot_buf_ptr.add(dst + 1), in_r);
                     }
                 }
 
-                let remainder = frames - frames_until_wrap;
-                for i in 0..remainder {
-                    let src_idx = frames_until_wrap + i;
-                    let in_l = *input.add(src_idx * input_channels);
-                    let in_r = *input.add(src_idx * input_channels + 1);
-                    let dst_idx = i * channels + channel_offset;
-                    if dst_idx + 1 < buffer_len {
-                        loopback_buffer[dst_idx] = in_l;
-                        loopback_buffer[dst_idx + 1] = in_r;
-                    }
+                let output_sample_time = cycle_info.mOutputTime.mSampleTime + (frames as f64);
+                slot.last_write_time.store(output_sample_time.to_bits(), Ordering::Release);
+                (*driver).is_buffer_clear.store(false, Ordering::Release);
+
+                if frames > 0 {
+                    let sample_l = *input;
+                    let sample_r = *input.add(1);
+                    log_msg(&format!(
+                        "[ProcessOutput] client_id={} pid={} ch_offset={} output_time={:.0} data[0]={:.4} data[1]={:.4}",
+                        _client_id,
+                        slot.pid.load(Ordering::Relaxed),
+                        channel_offset,
+                        cycle_info.mOutputTime.mSampleTime,
+                        sample_l,
+                        sample_r
+                    ));
                 }
-            }
-
-            let output_sample_time = cycle_info.mOutputTime.mSampleTime + (frames as f64);
-            slot.last_write_time.store(output_sample_time.to_bits(), Ordering::Release);
-            (*driver).is_buffer_clear.store(false, Ordering::Release);
-
-            if frames > 0 {
-                let first_frame_idx = w_pos * channels + channel_offset;
-                let sample_l = *input;
-                let sample_r = *input.add(1);
-                log_msg(&format!(
-                    "[ProcessOutput] client_id={} pid={} ch_offset={} w_pos={} output_time={:.0} data[0]={:.4} data[1]={:.4} abs_idx={} -> ch[{},{}]",
-                    _client_id,
-                    slot.pid.load(Ordering::Relaxed),
-                    channel_offset,
-                    w_pos,
-                    cycle_info.mOutputTime.mSampleTime,
-                    sample_l,
-                    sample_r,
-                    first_frame_idx,
-                    channel_offset,
-                    channel_offset + 1
-                ));
             }
         }
     } else if _operation_id == kAudioServerPlugInIOOperationWriteMix {
@@ -1666,25 +1702,48 @@ unsafe extern "C" fn do_io_operation(
             let slot = &slots[slot_idx];
             let pid = slot.pid.load(Ordering::Relaxed);
 
-            // First, copy all channels from ring buffer to output
-            if frames <= frames_until_wrap {
-                let src_ptr = loopback_buffer.as_ptr().add(r_pos * channels);
-                let dst_ptr = output;
-                ptr::copy_nonoverlapping(src_ptr, dst_ptr, frames * channels);
-            } else {
-                let src_ptr1 = loopback_buffer.as_ptr().add(r_pos * channels);
-                let dst_ptr1 = output;
-                ptr::copy_nonoverlapping(src_ptr1, dst_ptr1, frames_until_wrap * channels);
-
-                let remainder = frames - frames_until_wrap;
-                let src_ptr2 = loopback_buffer.as_ptr();
-                let dst_ptr2 = output.add(frames_until_wrap * channels);
-                ptr::copy_nonoverlapping(src_ptr2, dst_ptr2, remainder * channels);
+            // Initialize output buffer to zero using vectorized clear
+            unsafe {
+                accelerate::clear(output, frames * channels);
             }
 
-            // Check timing for each channel pair and zero out stale data
-            // If we're trying to read data that hasn't been written yet, zero it out
-            for slot in slots.iter() {
+            // Copy system mix (written by WriteMix) from loopback_buffer channels 0/1 into output
+            if frames <= frames_until_wrap {
+                let src_ptr = loopback_buffer.as_ptr().add(r_pos * channels);
+                for i in 0..frames {
+                    let src_idx = i * channels;
+                    let dst_idx = i * channels;
+                    unsafe {
+                        *output.add(dst_idx) = *src_ptr.add(src_idx);
+                        *output.add(dst_idx + 1) = *src_ptr.add(src_idx + 1);
+                    }
+                }
+            } else {
+                let src_ptr1 = loopback_buffer.as_ptr().add(r_pos * channels);
+                for i in 0..frames_until_wrap {
+                    let src_idx = i * channels;
+                    let dst_idx = i * channels;
+                    unsafe {
+                        *output.add(dst_idx) = *src_ptr1.add(src_idx);
+                        *output.add(dst_idx + 1) = *src_ptr1.add(src_idx + 1);
+                    }
+                }
+                let remainder = frames - frames_until_wrap;
+                let src_ptr2 = loopback_buffer.as_ptr();
+                for i in 0..remainder {
+                    let src_idx = i * channels;
+                    let dst_idx = (frames_until_wrap + i) * channels;
+                    unsafe {
+                        *output.add(dst_idx) = *src_ptr2.add(src_idx);
+                        *output.add(dst_idx + 1) = *src_ptr2.add(src_idx + 1);
+                    }
+                }
+            }
+
+            // Mix per-slot buffers into output for active clients
+            let slots_ref = &(*driver).client_slots;
+            let input_end = input_sample_time + (frames as f64);
+            for slot in slots_ref.iter() {
                 let client_id = slot.client_id.load(Ordering::Acquire);
                 if client_id == 0 {
                     continue;
@@ -1698,18 +1757,29 @@ unsafe extern "C" fn do_io_operation(
                 let last_write_bits = slot.last_write_time.load(Ordering::Acquire);
                 let last_write_time = f64::from_bits(last_write_bits);
 
-                // 可視化ログ: 毎回出力（頻度制限なし）
                 log_msg(&format!(
                     "[TimingCheck] client_id={} ch_offset={} input_sample_time={:.0} last_write_time={:.0} frames={} delta={:.0}",
-                    client_id, channel_offset, input_sample_time, last_write_time, frames, (input_sample_time + (frames as f64)) - last_write_time
+                    client_id, channel_offset, input_sample_time, last_write_time, frames, input_end - last_write_time
                 ));
 
-                // If we're reading data that hasn't been written yet, zero it out
-                if input_sample_time + (frames as f64) > last_write_time {
-                    for i in 0..frames {
-                        let dst_idx = i * channels + channel_offset;
-                        *output.add(dst_idx) = 0.0;
-                        *output.add(dst_idx + 1) = 0.0;
+                // If this slot has recent data covering the read window, mix it in
+                if input_end <= last_write_time {
+                    let slot_buf_ptr = slot.slot_buffer.as_ptr();
+                    unsafe {
+                        accelerate::add_inplace(
+                            slot_buf_ptr,
+                            2,
+                            output.add(channel_offset),
+                            channels as isize,
+                            frames,
+                        );
+                        accelerate::add_inplace(
+                            slot_buf_ptr.add(1),
+                            2,
+                            output.add(channel_offset + 1),
+                            channels as isize,
+                            frames,
+                        );
                     }
                 }
             }
@@ -1772,6 +1842,34 @@ fn notify_device_property_changed(driver: *mut PrismDriver, selector: AudioObjec
     }
 }
 
+// Zero an entire stereo pair across the loopback buffer for the given channel offset.
+// This is used when a client is removed or re-routed so stale audio does not remain in the ring.
+unsafe fn zero_channel_pair(driver: *mut PrismDriver, channel_offset: usize) {
+    if driver.is_null() {
+        return;
+    }
+    let channels = (*driver).config.num_channels as usize;
+    if channel_offset < 2 || channel_offset + 1 >= channels {
+        return;
+    }
+
+    let buf = &mut (*driver).loopback_buffer;
+    let buffer_len = buf.len();
+    if buffer_len == 0 {
+        return;
+    }
+    let frames = buffer_len / channels;
+
+    for f in 0..frames {
+        let idx = f * channels + channel_offset;
+        // bounds should hold, but be defensive
+        if idx + 1 < buffer_len {
+            buf[idx] = 0.0;
+            buf[idx + 1] = 0.0;
+        }
+    }
+}
+
 // V-Table storage
 static mut DRIVER_VTABLE: AudioServerPlugInDriverInterface = AudioServerPlugInDriverInterface {
     _reserved: ptr::null_mut(),
@@ -1810,12 +1908,15 @@ pub fn create_driver() -> *mut PrismDriver {
             let buffer_size = 65536 * config.num_channels as usize; // 65536 frames * channels
 
             let mut client_slots = Vec::with_capacity(MAX_CLIENTS);
+            let slot_buf_len = config.buffer_frame_size as usize * 2; // stereo
             for _ in 0..MAX_CLIENTS {
                 client_slots.push(ClientSlot {
                     client_id: AtomicU32::new(0),
                     channel_offset: AtomicUsize::new(0),
                     pid: AtomicI32::new(0),
                     last_write_time: AtomicU64::new(0),
+                    slot_active: AtomicBool::new(false),
+                    slot_buffer: vec![0.0; slot_buf_len],
                 });
             }
 
