@@ -50,7 +50,7 @@ The installer copies `Prism.driver` into `/Library/Audio/Plug-Ins/HAL/` and refr
 
 4. **Reboot**
 
-Reboot macOS to allow the HAL plug-in to load. 
+Reboot macOS to allow the HAL plug-in to load.
 
 ## Usage
 

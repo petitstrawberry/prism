@@ -50,9 +50,12 @@ mod accelerate {
 pub struct PrismConfig {
     pub buffer_frame_size: u32,
     pub safety_offset: u32,
-    pub ring_buffer_frame_size: u32,
     pub zero_timestamp_period: u32,
     pub num_channels: u32,
+    /// Per-slot ring buffer size in frames. Larger values provide more margin
+    /// against audio dropouts but use more memory. Default 16384 frames
+    /// (~85ms @ 192kHz, ~340ms @ 48kHz). Memory = slots × frames × 2ch × 4bytes.
+    pub slot_buffer_frame_size: u32,
 }
 
 impl PrismConfig {
@@ -60,9 +63,9 @@ impl PrismConfig {
         Self {
             buffer_frame_size: 1024,
             safety_offset: 256,
-            ring_buffer_frame_size: 1024,
             zero_timestamp_period: 1024,
             num_channels: 64, // Increased to 64 for OMNIBUS-style routing
+            slot_buffer_frame_size: 16384, // ~85ms @ 192kHz, ~340ms @ 48kHz
         }
     }
 
@@ -93,6 +96,22 @@ pub struct ClientSlot {
     // Per-slot small ring buffer for stereo frames (length = buffer_frame_size * 2)
     // Preallocated at driver creation to avoid allocs in IO path.
     pub slot_buffer: Vec<f32>,
+}
+
+impl ClientSlot {
+    fn resize_and_clear_buffer(&mut self, frames_per_buffer: usize) {
+        let required_len = frames_per_buffer.saturating_mul(2);
+        if required_len == 0 {
+            self.slot_buffer.clear();
+        } else {
+            if self.slot_buffer.len() != required_len {
+                self.slot_buffer.resize(required_len, 0.0);
+            }
+            for sample in &mut self.slot_buffer {
+                *sample = 0.0;
+            }
+        }
+    }
 }
 
 fn encode_client_list(driver: &PrismDriver) -> Vec<u8> {
@@ -138,6 +157,9 @@ pub struct PrismDriver {
     // Timing synchronization (like BlackHole)
     pub last_output_sample_time: AtomicU64, // Tracks when data was last written
     pub is_buffer_clear: AtomicBool,        // Tracks if buffer has valid data
+
+    // Actual buffer frame size (may differ from config if host uses different size)
+    pub buffer_frame_size_actual: AtomicU32,
 
     // Padding to prevent false sharing between write_pos and read_pos
     // Cache line size is typically 64 bytes.
@@ -618,13 +640,13 @@ unsafe extern "C" fn is_property_settable(
         return 0;
     }
 
-    let res = if selector == kAudioPrismPropertyRoutingTable ||
-       selector == kAudioDevicePropertyDeviceName ||
-       selector == kAudioObjectPropertyName ||
-       selector == kAudioDevicePropertyDataSource || // Add ssrc
-       selector == kAudioDevicePropertyNominalSampleRate
+    let res = if selector == kAudioPrismPropertyRoutingTable
+        || selector == kAudioDevicePropertyDeviceName
+        || selector == kAudioObjectPropertyName
+        || selector == kAudioDevicePropertyDataSource
+        || selector == kAudioDevicePropertyNominalSampleRate
+        || selector == kAudioDevicePropertyBufferFrameSize
     {
-        // Add nsrt
         *_out_is_settable = 1;
         true
     } else {
@@ -1116,7 +1138,7 @@ unsafe extern "C" fn get_property_data(
                 }
                 kAudioDevicePropertyRingBufferFrameSize => {
                     let out = _out_data as *mut UInt32;
-                    *out = (*driver).config.ring_buffer_frame_size;
+                    *out = (*driver).config.buffer_frame_size;
                     *_out_data_size = std::mem::size_of::<UInt32>() as UInt32;
                 }
                 kAudioObjectPropertyScope => {
@@ -1301,6 +1323,51 @@ unsafe extern "C" fn set_property_data(
         "Prism: SetPropertyData called. Object: {}, Selector: {}",
         _object_id, selector
     ));
+
+    if selector == kAudioDevicePropertyBufferFrameSize {
+        if _in_data_size != std::mem::size_of::<UInt32>() as UInt32 {
+            return kAudioHardwareBadPropertySizeError as OSStatus;
+        }
+
+        let requested_frames = unsafe { *(_in_data as *const UInt32) };
+        if requested_frames == 0 {
+            return kAudioHardwareIllegalOperationError as OSStatus;
+        }
+
+        let mut changed = false;
+        {
+            let driver_mut = unsafe { &mut *driver };
+            if driver_mut.config.buffer_frame_size != requested_frames {
+                log_msg(&format!(
+                    "Prism: BufferFrameSize updated from {} to {}",
+                    driver_mut.config.buffer_frame_size, requested_frames
+                ));
+
+                driver_mut.config.buffer_frame_size = requested_frames;
+                driver_mut.config.zero_timestamp_period = requested_frames;
+
+                let frames_usize = requested_frames as usize;
+                for slot in driver_mut.client_slots.iter_mut() {
+                    slot.resize_and_clear_buffer(frames_usize);
+                    slot.last_write_time.store(0, Ordering::Release);
+                }
+
+                driver_mut
+                    .last_output_sample_time
+                    .store(0, Ordering::Release);
+                driver_mut.is_buffer_clear.store(true, Ordering::Release);
+                changed = true;
+            }
+        }
+
+        if changed {
+            notify_device_property_changed(driver, kAudioDevicePropertyBufferFrameSize);
+            notify_device_property_changed(driver, kAudioDevicePropertyRingBufferFrameSize);
+            notify_device_property_changed(driver, kAudioDevicePropertyZeroTimeStampPeriod);
+        }
+
+        return 0;
+    }
 
     if selector == kAudioPrismPropertyRoutingTable {
         // CFData-only: expect a CFDataRef containing the little-endian PrismRoutingUpdate bytes
@@ -1580,6 +1647,15 @@ unsafe extern "C" fn do_io_operation(
         if _stream_id != OUTPUT_STREAM_ID {
             return 0;
         }
+        // Use actual frame size; update if mismatch detected
+        let current_actual = (*driver).buffer_frame_size_actual.load(Ordering::Relaxed) as usize;
+        if frames != current_actual && frames > 0 {
+            log_msg(&format!(
+                "[ProcessOutput] adapting buffer_frame_size {} -> {}",
+                current_actual, frames
+            ));
+            (*driver).buffer_frame_size_actual.store(frames as u32, Ordering::Relaxed);
+        }
         if !_io_main_buffer.is_null() {
             let idx = (_client_id as usize) & (MAX_CLIENTS - 1);
             let slots = &(*driver).client_slots;
@@ -1594,20 +1670,52 @@ unsafe extern "C" fn do_io_operation(
                 return 0;
             }
 
-            // Write into the per-slot buffer (stereo: left/right interleaved)
+
+
+            log_msg(&format!(
+                "[ProcessOutput] sample_time={:.0} frames={}",
+                cycle_info.mOutputTime.mSampleTime,
+                frames
+            ));
+
+            // Write into the per-slot ring buffer (stereo: left/right interleaved)
             if !_io_main_buffer.is_null() {
                 let input = _io_main_buffer as *const f32;
                 let input_channels = 2;
                 let slots_ref = &(*driver).client_slots;
                 let idx = (_client_id as usize) & (MAX_CLIENTS - 1);
                 let slot_buf_ptr = slots_ref[idx].slot_buffer.as_ptr() as *mut f32;
+                let slot_buf_frames = slots_ref[idx].slot_buffer.len() / 2; // stereo frames
 
-                // Write sequentially into slot buffer for this IO cycle (0..frames-1)
-                for i in 0..frames {
-                    let in_l = *input.add(i * input_channels);
-                    let in_r = *input.add(i * input_channels + 1);
-                    let dst = i * 2;
-                    unsafe {
+                // Ring buffer write: use sample_time to determine position
+                let sample_time = cycle_info.mOutputTime.mSampleTime as usize;
+                let w_pos = sample_time % slot_buf_frames;
+                let frames_until_wrap = slot_buf_frames - w_pos;
+
+                if frames <= frames_until_wrap {
+                    // No wrapping needed
+                    for i in 0..frames {
+                        let in_l = *input.add(i * input_channels);
+                        let in_r = *input.add(i * input_channels + 1);
+                        let dst = (w_pos + i) * 2;
+                        std::ptr::write(slot_buf_ptr.add(dst), in_l);
+                        std::ptr::write(slot_buf_ptr.add(dst + 1), in_r);
+                    }
+                } else {
+                    // Wrapping needed
+                    for i in 0..frames_until_wrap {
+                        let in_l = *input.add(i * input_channels);
+                        let in_r = *input.add(i * input_channels + 1);
+                        let dst = (w_pos + i) * 2;
+                        std::ptr::write(slot_buf_ptr.add(dst), in_l);
+                        std::ptr::write(slot_buf_ptr.add(dst + 1), in_r);
+                    }
+                    let remainder = frames - frames_until_wrap;
+                    for i in 0..remainder {
+                        let src_idx = frames_until_wrap + i;
+                        let in_l = *input.add(src_idx * input_channels);
+                        let in_r = *input.add(src_idx * input_channels + 1);
+                        let dst = i * 2;
                         std::ptr::write(slot_buf_ptr.add(dst), in_l);
                         std::ptr::write(slot_buf_ptr.add(dst + 1), in_r);
                     }
@@ -1708,6 +1816,26 @@ unsafe extern "C" fn do_io_operation(
             let r_pos = sample_time % buffer_frames;
             let frames_until_wrap = buffer_frames - r_pos;
 
+            // Use actual frame size; update if mismatch detected
+            let current_actual = (*driver).buffer_frame_size_actual.load(Ordering::Relaxed) as usize;
+            if frames != current_actual && frames > 0 {
+                log_msg(&format!(
+                    "[ReadInput] adapting buffer_frame_size {} -> {}",
+                    current_actual, frames
+                ));
+                (*driver).buffer_frame_size_actual.store(frames as u32, Ordering::Relaxed);
+            }
+
+            let last_output_bits = (*driver).last_output_sample_time.load(Ordering::Acquire);
+            let last_output_time = f64::from_bits(last_output_bits);
+            log_msg(&format!(
+                "[ReadInput] sample_time={:.0} frames={} last_output_time={:.0} delta={:.0}",
+                input_sample_time,
+                frames,
+                last_output_time,
+                input_sample_time - last_output_time
+            ));
+
             // Log every ReadInput call (unconditionally)
             let slots = &(*driver).client_slots;
             let slot_idx = (_client_id as usize) & (MAX_CLIENTS - 1);
@@ -1769,29 +1897,67 @@ unsafe extern "C" fn do_io_operation(
                 let last_write_bits = slot.last_write_time.load(Ordering::Acquire);
                 let last_write_time = f64::from_bits(last_write_bits);
 
-                log_msg(&format!(
-                    "[TimingCheck] client_id={} ch_offset={} input_sample_time={:.0} last_write_time={:.0} frames={} delta={:.0}",
-                    client_id, channel_offset, input_sample_time, last_write_time, frames, input_end - last_write_time
-                ));
-
-                // If this slot has recent data covering the read window, mix it in
-                if input_end <= last_write_time {
+                // Mix if slot has been written to (ring buffer always has valid data after first write)
+                if last_write_time > 0.0 {
                     let slot_buf_ptr = slot.slot_buffer.as_ptr();
-                    unsafe {
-                        accelerate::add_inplace(
-                            slot_buf_ptr,
-                            2,
-                            output.add(channel_offset),
-                            channels as isize,
-                            frames,
-                        );
-                        accelerate::add_inplace(
-                            slot_buf_ptr.add(1),
-                            2,
-                            output.add(channel_offset + 1),
-                            channels as isize,
-                            frames,
-                        );
+                    let slot_buf_frames = slot.slot_buffer.len() / 2; // stereo frames
+                    let slot_r_pos = (input_sample_time as usize) % slot_buf_frames;
+                    let slot_frames_until_wrap = slot_buf_frames - slot_r_pos;
+
+                    if frames <= slot_frames_until_wrap {
+                        // No wrapping: single contiguous read
+                        unsafe {
+                            accelerate::add_inplace(
+                                slot_buf_ptr.add(slot_r_pos * 2),
+                                2,
+                                output.add(channel_offset),
+                                channels as isize,
+                                frames,
+                            );
+                            accelerate::add_inplace(
+                                slot_buf_ptr.add(slot_r_pos * 2 + 1),
+                                2,
+                                output.add(channel_offset + 1),
+                                channels as isize,
+                                frames,
+                            );
+                        }
+                    } else {
+                        // Wrapping: read in two parts
+                        unsafe {
+                            // First part: from slot_r_pos to end
+                            accelerate::add_inplace(
+                                slot_buf_ptr.add(slot_r_pos * 2),
+                                2,
+                                output.add(channel_offset),
+                                channels as isize,
+                                slot_frames_until_wrap,
+                            );
+                            accelerate::add_inplace(
+                                slot_buf_ptr.add(slot_r_pos * 2 + 1),
+                                2,
+                                output.add(channel_offset + 1),
+                                channels as isize,
+                                slot_frames_until_wrap,
+                            );
+                            // Second part: from start
+                            let remainder = frames - slot_frames_until_wrap;
+                            let out_offset = slot_frames_until_wrap * channels;
+                            accelerate::add_inplace(
+                                slot_buf_ptr,
+                                2,
+                                output.add(channel_offset + out_offset),
+                                channels as isize,
+                                remainder,
+                            );
+                            accelerate::add_inplace(
+                                slot_buf_ptr.add(1),
+                                2,
+                                output.add(channel_offset + 1 + out_offset),
+                                channels as isize,
+                                remainder,
+                            );
+                        }
                     }
                 }
             }
@@ -1825,7 +1991,7 @@ unsafe extern "C" fn end_io_operation(
 
 // Helper for logging
 fn log_msg(msg: &str) {
-    #[cfg(debug_assertions)]
+    // #[cfg(debug_assertions)]
     {
         use std::ffi::CString;
         unsafe {
@@ -1921,7 +2087,8 @@ pub fn create_driver() -> *mut PrismDriver {
             let buffer_size = 65536 * config.num_channels as usize; // 65536 frames * channels
 
             let mut client_slots = Vec::with_capacity(MAX_CLIENTS);
-            let slot_buf_len = config.buffer_frame_size as usize * 2; // stereo
+            // Per-slot stereo ring buffer (configurable size)
+            let slot_buf_len = (config.slot_buffer_frame_size as usize) * 2;
             for _ in 0..MAX_CLIENTS {
                 client_slots.push(ClientSlot {
                     client_id: AtomicU32::new(0),
@@ -1946,6 +2113,7 @@ pub fn create_driver() -> *mut PrismDriver {
                 config,
                 last_output_sample_time: AtomicU64::new(0),
                 is_buffer_clear: AtomicBool::new(true),
+                buffer_frame_size_actual: AtomicU32::new(config.buffer_frame_size),
                 _pad1: [0; 64],
                 write_pos: AtomicUsize::new(0),
                 _pad2: [0; 64],
