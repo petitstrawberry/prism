@@ -1,6 +1,6 @@
 # Prism – macOS Virtual Audio Router
 
-Prism is a fail-secure virtual routing device for macOS. It exposes a 64-channel bus where every app can be pinned to its own stereo pair, so you can feed OBS, DAWs, and recorders with isolated tracks while preserving a separate monitor mix. The driver is written in Rust and uses Accelerate (vDSP) for its realtime mixing path.
+Prism is a virtual routing device for macOS. It exposes a 64-channel bus where every app can be pinned to its own stereo pair, so you can feed OBS, DAWs, and recorders with isolated tracks while preserving a separate monitor mix. The driver is written in Rust and uses Accelerate (vDSP) for its realtime mixing path.
 
 ## Highlights
 
