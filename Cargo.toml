@@ -1,6 +1,6 @@
 [package]
 name = "prism"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 
 [lib]
@@ -16,9 +16,9 @@ path = "src/bin/prism.rs"
 
 [dependencies]
 coreaudio-sys = "0.2"
-libc = "0.2"
+libc = "0.2.178"
 syslog = "7.0.0"
-log = "0.4"
+log = "0.4.29"
 core-foundation = "0.10.1"
 cocoa = "0.26.1"
 objc = "0.2"
