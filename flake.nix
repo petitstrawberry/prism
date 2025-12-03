@@ -197,7 +197,7 @@
             # Default to stable if no toolchain file found or parsing fails.
             channel=stable
             if [ -f rust-toolchain.toml ]; then
-              channel=$(awk -F" '/channel/ {print $2; exit}' rust-toolchain.toml || echo stable)
+              channel=$(awk -F'"' '/channel/ {print $2; exit}' rust-toolchain.toml || echo stable)
             fi
 
             if command -v rustup >/dev/null 2>&1; then
