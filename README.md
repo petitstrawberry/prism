@@ -1,77 +1,104 @@
-# Prism – High-Fidelity macOS Virtual Audio Routing
+# Prism – macOS Virtual Audio Router
 
-Prism is a high‑performance, fail‑secure virtual audio device for macOS that enables per‑application routing of audio streams. 
+Prism is a fail-secure virtual routing device for macOS. It exposes a 64-channel bus where every app can be pinned to its own stereo pair, so you can feed OBS, DAWs, and recorders with isolated tracks while preserving a separate monitor mix. The driver is written in Rust and uses Accelerate (vDSP) for its realtime mixing path.
 
-## Features
+## Highlights
 
-- **Per-Application Routing**: Route audio from specific applications to designated channels.
-- **Fully customizable**: Configure routing rules dynamically via a command-line interface.
-- **Low Latency**: Designed for real-time audio processing with minimal delay.
-- **Robust Driver**: Built with Rust for safety and performance.
+- **Per-application routing** – send each process to its own stereo pair on the 64-channel bus.
+- **Separable stems** – capture game audio, voice chat, music, and system alerts on independent channels for streaming or editing.
+- **Instant muting on reroute** – Prism clears a slot the moment an app disconnects or moves, so recordings never pick up stale audio.
+- **Automation-ready** – drive routing changes via the `prism` CLI or by scripting its Unix socket API.
 
-## Installation
+## Use cases
 
-**Prerequisites:** Xcode Command Line Tools, Rust.
+- **Streaming with OBS/Streamlabs** – capture the game, voice chat, and music on isolated inputs so the mixer scene stays tidy.
+- **Multitrack podcasting or post-production** – record each participant or app feed to its own track inside Logic, Reaper, or Audition.
+- **Hybrid events** – send different mixes to Zoom, in-room PA, and a backup recorder without touching physical patch bays.
+- **Creative monitoring** – audition reference audio or click tracks privately while the audience hears only the main program.
 
-### 1. Build & Install Daemon and CLI Tool
+## Prerequisites
+
+- macOS 13 or later.
+- Xcode Command Line Tools (`xcode-select --install`).
+- Rust toolchain (`rustup`), using the default stable channel.
+
+## Build and Install
+
+1. **Install the CLI and daemon**
+
 ```bash
 cargo install --path .
 ```
 
-### 2. Build & Install Driver
+`cargo install` places `prism` and `prismd` under `~/.cargo/bin/`; ensure that directory is on your `PATH`.
+
+2. **Build the CoreAudio driver bundle**
+
 ```bash
 ./build_driver.sh
-./install.sh
 ```
 
-### 3. Reboot
-**Reboot your Mac** to load the driver.
-*(Note: Manual `coreaudiod` restart is unsafe and not performed.)*
+This script compiles the plugin binary, updates the bundle under `Prism.driver/`, and performs codesign stubs if required.
+
+3. **Install the driver**
+
+```bash
+sudo ./install.sh
+```
+
+The installer copies `Prism.driver` into `/Library/Audio/Plug-Ins/HAL/` and refreshes permissions.
+
+4. **Reboot**
+
+Reboot macOS to allow the HAL plug-in to load. Restarting `coreaudiod` manually is not supported.
 
 ## Usage
 
-Start the daemon
-- Run `prismd` in the background. It stays resident and listens for client list changes from the driver:
+1. **Launch the daemon**
 
 ```bash
-prismd &
+prismd --daemonize
 ```
 
-Use the CLI
-- The `prism` command sends requests to `prismd`, which performs all driver operations:
+The `--daemonize` flag double-forks and detaches `prismd`. Omit it if you prefer to run in the foreground for logging.
+
+2. **Manage routing with the CLI**
 
 ```bash
-# Show active Prism clients
+# List all currently attached clients and their channel offsets
 prism clients
 
-# Send a routing update: prism set <PID> <OFFSET>
-prism set 12345 2
-
-# Explore interactively
-prism repl
+# Route PID 12345 to the stereo slot that starts at channel offset 4
+prism set 12345 4
 ```
 
-The interactive REPL mirrors the standalone commands (`set`, `list`, `clients`, `help`, `exit`). Ensure `prismd` is running before invoking the CLI.
+Routing requests are serialized as a custom `'rout'` property containing `{ pid: i32, channel_offset: u32 }`. The driver consumes the property, updates the slot table, and clears the corresponding loopback pair if the client moved.
 
-How routing updates work
-- The CLI sends a custom CoreAudio property (`'rout'`) containing a binary struct `{ pid: i32, channel_offset: u32 }`. The driver uses that information to map a source PID to a channel offset.
+Use `prism --help` to discover additional subcommands.
+
+### Mixing model
+
+- The capture side exposes all 64 channels. Channels 1/2 always carry the system mix written by `WriteMix`.
+- Each registered client owns a dedicated stereo slot buffer sized to `buffer_frame_size` (1024 frames by default).
+- During `ReadInput`, Prism zeroes the capture buffer and sums the system mix with any slots whose most recent write covers the current IO cycle. This guarantees freshly-written audio only.
+- Slot buffers are preallocated (4096 slots × 1024 frames × stereo ≈ 32 MB) so no heap work happens in the realtime path.
+- Accelerate’s `vDSP_vclr` and `vDSP_vadd` handle zeroing and accumulation, keeping the hot loop vectorized.
 
 ## Uninstall
 
-## 1. Uninstall Deamon and CLI tool
+1. Remove the CLI and daemon binaries (optional):
 
 ```bash
-# Remove the installed crate (package name: "prism")
 cargo uninstall prism
 ```
 
-## 2. Uninstall Driver
+2. Remove the driver bundle:
 
 ```bash
-./uninstall.sh
+sudo ./uninstall.sh
 ```
 
-Reboot to finish.
+3. Reboot to unload the HAL plug-in.
 
 ## License
 

@@ -6,17 +6,19 @@ mod host;
 #[path = "../socket.rs"]
 mod socket;
 
+use clap::Parser;
 use coreaudio_sys::*;
 use host::{
     fetch_client_list, find_prism_device, read_custom_property_info, send_rout_update, ClientEntry,
     K_AUDIO_PRISM_PROPERTY_CLIENT_LIST,
 };
-use prism::ipc::{ClientInfoPayload, CommandRequest, CustomPropertyPayload, RoutingUpdateAck, RpcResponse};
+use prism::ipc::{
+    ClientInfoPayload, CommandRequest, CustomPropertyPayload, RoutingUpdateAck, RpcResponse,
+};
 use prism::process as procinfo;
 use serde::Serialize;
 use std::collections::HashSet;
 use std::env;
-use clap::Parser;
 use std::ffi::c_void;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Write};
@@ -311,7 +313,9 @@ fn handle_ipc_command(raw: &str, device_id: AudioObjectID) -> String {
     };
 
     match request {
-        CommandRequest::Help => json_error("help is provided by the CLI; run 'prism --help' locally".to_string()),
+        CommandRequest::Help => {
+            json_error("help is provided by the CLI; run 'prism --help' locally".to_string())
+        }
         CommandRequest::Clients => match build_clients_payload(device_id) {
             Ok(payload) => json_success_with_data(payload),
             Err(err) => json_error(format!("failed to fetch clients: {}", err)),
@@ -373,8 +377,12 @@ fn handle_ipc_command(raw: &str, device_id: AudioObjectID) -> String {
 
                         if should_update {
                             match send_rout_update(device_id, client.pid, offset) {
-                                Ok(()) => results.push(RoutingUpdateAck { pid: client.pid, channel_offset: offset }),
-                                Err(err) => errors.push(format!("failed to set pid {}: {}", client.pid, err)),
+                                Ok(()) => results.push(RoutingUpdateAck {
+                                    pid: client.pid,
+                                    channel_offset: offset,
+                                }),
+                                Err(err) => errors
+                                    .push(format!("failed to set pid {}: {}", client.pid, err)),
                             }
                         }
                     }
@@ -383,7 +391,11 @@ fn handle_ipc_command(raw: &str, device_id: AudioObjectID) -> String {
                         if errors.is_empty() {
                             return json_error(format!("no clients found for app '{}'.", app_name));
                         } else {
-                            return json_error(format!("all matching clients failed for app '{}': {}", app_name, errors.join("; ")));
+                            return json_error(format!(
+                                "all matching clients failed for app '{}': {}",
+                                app_name,
+                                errors.join("; ")
+                            ));
                         }
                     }
 

@@ -88,7 +88,7 @@ pub struct ClientSlot {
     pub client_id: AtomicU32,
     pub channel_offset: AtomicUsize,
     pub pid: AtomicI32,
-    pub last_write_time: AtomicU64,  // Per-channel timing tracking
+    pub last_write_time: AtomicU64, // Per-channel timing tracking
     pub slot_active: AtomicBool,
     // Per-slot small ring buffer for stereo frames (length = buffer_frame_size * 2)
     // Preallocated at driver creation to avoid allocs in IO path.
@@ -136,8 +136,8 @@ pub struct PrismDriver {
     pub config: PrismConfig,
 
     // Timing synchronization (like BlackHole)
-    pub last_output_sample_time: AtomicU64,  // Tracks when data was last written
-    pub is_buffer_clear: AtomicBool,         // Tracks if buffer has valid data
+    pub last_output_sample_time: AtomicU64, // Tracks when data was last written
+    pub is_buffer_clear: AtomicBool,        // Tracks if buffer has valid data
 
     // Padding to prevent false sharing between write_pos and read_pos
     // Cache line size is typically 64 bytes.
@@ -358,7 +358,9 @@ unsafe extern "C" fn remove_device_client(
                 let buf_ptr = slots_ref[idx].slot_buffer.as_ptr() as *mut f32;
                 let buf_len = slots_ref[idx].slot_buffer.len();
                 for i in 0..buf_len {
-                    unsafe { std::ptr::write(buf_ptr.add(i), 0.0); }
+                    unsafe {
+                        std::ptr::write(buf_ptr.add(i), 0.0);
+                    }
                 }
             }
             // Also zero the ring pair if necessary
@@ -1226,7 +1228,11 @@ unsafe extern "C" fn get_property_data(
                 }
                 kAudioStreamPropertyVirtualFormat | kAudioStreamPropertyPhysicalFormat => {
                     let out = _out_data as *mut AudioStreamBasicDescription;
-                    let channels_per_frame: u32 = if object_id == OUTPUT_STREAM_ID { 2 } else { (*driver).config.num_channels };
+                    let channels_per_frame: u32 = if object_id == OUTPUT_STREAM_ID {
+                        2
+                    } else {
+                        (*driver).config.num_channels
+                    };
                     *out = AudioStreamBasicDescription {
                         mSampleRate: 48000.0,
                         mFormatID: kAudioFormatLinearPCM,
@@ -1244,7 +1250,11 @@ unsafe extern "C" fn get_property_data(
                 | kAudioStreamPropertyAvailableVirtualFormats
                 | kAudioStreamPropertyAvailablePhysicalFormats => {
                     let out = _out_data as *mut AudioStreamRangedDescription;
-                    let channels_per_frame: u32 = if object_id == OUTPUT_STREAM_ID { 2 } else { (*driver).config.num_channels };
+                    let channels_per_frame: u32 = if object_id == OUTPUT_STREAM_ID {
+                        2
+                    } else {
+                        (*driver).config.num_channels
+                    };
                     *out = AudioStreamRangedDescription {
                         mFormat: AudioStreamBasicDescription {
                             mSampleRate: 48000.0,
@@ -1257,7 +1267,10 @@ unsafe extern "C" fn get_property_data(
                             mBitsPerChannel: 32,
                             mReserved: 0,
                         },
-                        mSampleRateRange: AudioValueRange { mMinimum: 48000.0, mMaximum: 48000.0 },
+                        mSampleRateRange: AudioValueRange {
+                            mMinimum: 48000.0,
+                            mMaximum: 48000.0,
+                        },
                     };
                     *_out_data_size = std::mem::size_of::<AudioStreamRangedDescription>() as UInt32;
                 }
@@ -1562,7 +1575,6 @@ unsafe extern "C" fn do_io_operation(
     //  - OUTPUT_STREAM_ID receives WriteMix (app playback into 64ch bus at a 2ch slot)
     //  - INPUT_STREAM_ID serves ReadInput (64ch bus exposed to capture clients)
     if _operation_id == kAudioServerPlugInIOOperationProcessOutput {
-
         log_msg(&format!("[ProcessOutput] stream_id={}", _stream_id));
 
         if _stream_id != OUTPUT_STREAM_ID {
@@ -1602,7 +1614,8 @@ unsafe extern "C" fn do_io_operation(
                 }
 
                 let output_sample_time = cycle_info.mOutputTime.mSampleTime + (frames as f64);
-                slot.last_write_time.store(output_sample_time.to_bits(), Ordering::Release);
+                slot.last_write_time
+                    .store(output_sample_time.to_bits(), Ordering::Release);
                 (*driver).is_buffer_clear.store(false, Ordering::Release);
 
                 if frames > 0 {
@@ -1670,7 +1683,9 @@ unsafe extern "C" fn do_io_operation(
             }
 
             let output_sample_time = cycle_info.mOutputTime.mSampleTime + (frames as f64);
-            (*driver).last_output_sample_time.store(output_sample_time.to_bits(), Ordering::Release);
+            (*driver)
+                .last_output_sample_time
+                .store(output_sample_time.to_bits(), Ordering::Release);
             (*driver).is_buffer_clear.store(false, Ordering::Release);
 
             if frames > 0 {
@@ -1678,10 +1693,7 @@ unsafe extern "C" fn do_io_operation(
                 let sample_r = *input.add(1);
                 log_msg(&format!(
                     "[WriteMix] system_mix w_pos={} output_time={:.0} data[0]={:.4} data[1]={:.4}",
-                    w_pos,
-                    cycle_info.mOutputTime.mSampleTime,
-                    sample_l,
-                    sample_r
+                    w_pos, cycle_info.mOutputTime.mSampleTime, sample_l, sample_r
                 ));
             }
         }
@@ -1818,7 +1830,8 @@ fn log_msg(msg: &str) {
         use std::ffi::CString;
         unsafe {
             // syslog(LOG_USER, ...)
-            let c_msg = CString::new(msg).unwrap_or_else(|_| CString::new("prism: log error").unwrap());
+            let c_msg =
+                CString::new(msg).unwrap_or_else(|_| CString::new("prism: log error").unwrap());
             libc::syslog(libc::LOG_USER | libc::LOG_INFO, c_msg.as_ptr());
         }
     }

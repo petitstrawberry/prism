@@ -3,7 +3,8 @@ mod socket;
 
 use clap::{Parser, Subcommand};
 use prism::ipc::{
-    ClientInfoPayload, CommandRequest, CustomPropertyPayload, HelpEntry, RoutingUpdateAck, RpcResponse,
+    ClientInfoPayload, CommandRequest, CustomPropertyPayload, HelpEntry, RoutingUpdateAck,
+    RpcResponse,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{self};
@@ -77,8 +78,15 @@ fn handle_apps(_args: Vec<String>) -> Result<(), String> {
     let mut groups: BTreeMap<String, Vec<u32>> = BTreeMap::new();
     let mut ungrouped: Vec<u32> = Vec::new();
     for client in &clients {
-        if let Some(name) = client.responsible_name.as_ref().or(client.process_name.as_ref()) {
-            groups.entry(name.clone()).or_default().push(client.channel_offset);
+        if let Some(name) = client
+            .responsible_name
+            .as_ref()
+            .or(client.process_name.as_ref())
+        {
+            groups
+                .entry(name.clone())
+                .or_default()
+                .push(client.channel_offset);
         } else {
             ungrouped.push(client.channel_offset);
         }
@@ -92,14 +100,20 @@ fn handle_apps(_args: Vec<String>) -> Result<(), String> {
         }
     }
     // Header
-    println!("{:<width$} | {:>16}", "App", "Channels", width = max_name_len);
+    println!(
+        "{:<width$} | {:>16}",
+        "App",
+        "Channels",
+        width = max_name_len
+    );
     println!("{}-+-{}", "-".repeat(max_name_len), "-".repeat(16));
     // Display groups
     for (name, offsets) in groups.iter() {
         let mut offsets = offsets.clone();
         offsets.sort_unstable();
         offsets.dedup();
-        let offset_str = offsets.iter()
+        let offset_str = offsets
+            .iter()
             .map(|o| {
                 let ch1 = o + 1;
                 let ch2 = o + 2;
@@ -107,14 +121,20 @@ fn handle_apps(_args: Vec<String>) -> Result<(), String> {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        println!("{:<width$} | {:>16}", name, offset_str, width = max_name_len);
+        println!(
+            "{:<width$} | {:>16}",
+            name,
+            offset_str,
+            width = max_name_len
+        );
     }
     // Display ungrouped
     if !ungrouped.is_empty() {
         let mut offsets = ungrouped.clone();
         offsets.sort_unstable();
         offsets.dedup();
-        let offset_str = offsets.iter()
+        let offset_str = offsets
+            .iter()
             .map(|o| {
                 let ch1 = o * 2;
                 let ch2 = o * 2 + 1;
@@ -122,7 +142,12 @@ fn handle_apps(_args: Vec<String>) -> Result<(), String> {
             })
             .collect::<Vec<_>>()
             .join(", ");
-        println!("{:<width$} | {:>16}", "(Ungrouped)", offset_str, width = max_name_len);
+        println!(
+            "{:<width$} | {:>16}",
+            "(Ungrouped)",
+            offset_str,
+            width = max_name_len
+        );
     }
     Ok(())
 }
@@ -145,12 +170,15 @@ fn handle_set_app(args: Vec<String>) -> Result<(), String> {
         }
         (ch1 - 1) as u32
     } else {
-        offset_arg
-            .parse()
-            .map_err(|_| "OFFSET must be a non-negative integer or channel range (e.g. 1-2)".to_string())?
+        offset_arg.parse().map_err(|_| {
+            "OFFSET must be a non-negative integer or channel range (e.g. 1-2)".to_string()
+        })?
     };
     // Delegate the app-level update to prismd (daemon) and display its result.
-    let response = send_request(&CommandRequest::SetApp { app_name: app_name.clone(), offset })?;
+    let response = send_request(&CommandRequest::SetApp {
+        app_name: app_name.clone(),
+        offset,
+    })?;
     let parsed: RpcResponse<Vec<RoutingUpdateAck>> = parse_response(&response)?;
     let (_message, results): (Option<String>, Vec<RoutingUpdateAck>) = extract_success(parsed)?;
 
@@ -158,7 +186,12 @@ fn handle_set_app(args: Vec<String>) -> Result<(), String> {
         println!("No clients found for app '{}'.", app_name);
     } else {
         let pids: Vec<String> = results.iter().map(|ack| ack.pid.to_string()).collect();
-        println!("Set offset={} for app '{}' (pids: {})", offset, app_name, pids.join(", "));
+        println!(
+            "Set offset={} for app '{}' (pids: {})",
+            offset,
+            app_name,
+            pids.join(", ")
+        );
     }
     Ok(())
 }
@@ -183,9 +216,9 @@ fn handle_set(args: Vec<String>) -> Result<(), String> {
         }
         (ch1 - 1) as u32
     } else {
-        args[1]
-            .parse()
-            .map_err(|_| "OFFSET must be a non-negative integer or channel range (e.g. 1-2)".to_string())?
+        args[1].parse().map_err(|_| {
+            "OFFSET must be a non-negative integer or channel range (e.g. 1-2)".to_string()
+        })?
     };
     execute_set(pid, offset)
 }
@@ -477,7 +510,6 @@ fn fallback_help_entries() -> Vec<HelpEntry> {
         HelpEntry::new("help", "help", "Show this help message"),
     ]
 }
-
 
 fn parse_response<T>(raw: &str) -> Result<RpcResponse<T>, String>
 where
