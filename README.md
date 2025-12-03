@@ -70,9 +70,14 @@ prism clients
 
 # Route PID 12345 to the stereo slot that starts at channel offset 4
 prism set 12345 4
+
+# Route an app by bundle display name without hunting for its PID
+prism set-app "Google Chrome" 3-4
 ```
 
 Routing requests are serialized as a custom `'rout'` property containing `{ pid: i32, channel_offset: u32 }`. The driver consumes the property, updates the slot table, and clears the corresponding loopback pair if the client moved.
+
+`prism set-app` uses process metadata to find the most recently active instance of the named app (partial matches allowed) and pins it to the requested stereo pair, making quick reroutes during a stream much easier than tracking PIDs.
 
 Use `prism --help` to discover additional subcommands.
 
