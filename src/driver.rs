@@ -92,6 +92,7 @@ pub struct ClientSlot {
     pub channel_offset: AtomicUsize,
     pub pid: AtomicI32,
     pub last_write_time: AtomicU64, // Per-channel timing tracking
+    #[allow(dead_code)]
     pub slot_active: AtomicBool,
     // Per-slot small ring buffer for stereo frames (length = buffer_frame_size * 2)
     // Preallocated at driver creation to avoid allocs in IO path.
@@ -890,7 +891,7 @@ unsafe extern "C" fn get_property_data(
                     let out = _out_data as *mut CFStringRef;
                     *out = CFStringCreateWithCString(
                         ptr::null(),
-                        "PetitStrawberry\0".as_ptr() as *const i8,
+                        c"PetitStrawberry".as_ptr(),
                         kCFStringEncodingUTF8,
                     );
                     *_out_data_size = std::mem::size_of::<CFStringRef>() as UInt32;
@@ -899,7 +900,7 @@ unsafe extern "C" fn get_property_data(
                     let out = _out_data as *mut CFStringRef;
                     *out = CFStringCreateWithCString(
                         ptr::null(),
-                        "dev.ichigo.driver.Prism\0".as_ptr() as *const i8,
+                        c"dev.ichigo.driver.Prism".as_ptr(),
                         kCFStringEncodingUTF8,
                     );
                     *_out_data_size = std::mem::size_of::<CFStringRef>() as UInt32;
@@ -930,7 +931,7 @@ unsafe extern "C" fn get_property_data(
                         let uid = *(_qualifier_data as *const CFStringRef);
                         let my_uid = CFStringCreateWithCString(
                             ptr::null(),
-                            "dev.ichigo.driver.Prism.Device\0".as_ptr() as *const i8,
+                            c"dev.ichigo.driver.Prism.Device".as_ptr(),
                             kCFStringEncodingUTF8,
                         );
                         if CFStringCompare(uid, my_uid, 0) == 0 {
@@ -1033,7 +1034,7 @@ unsafe extern "C" fn get_property_data(
                     let out = _out_data as *mut CFStringRef;
                     *out = CFStringCreateWithCString(
                         ptr::null(),
-                        "PetitStrawberry\0".as_ptr() as *const i8,
+                        c"PetitStrawberry".as_ptr(),
                         kCFStringEncodingUTF8,
                     );
                     *_out_data_size = std::mem::size_of::<CFStringRef>() as UInt32;
@@ -1042,7 +1043,7 @@ unsafe extern "C" fn get_property_data(
                     let out = _out_data as *mut CFStringRef;
                     *out = CFStringCreateWithCString(
                         ptr::null(),
-                        "dev.ichigo.driver.Prism.Device\0".as_ptr() as *const i8,
+                        c"dev.ichigo.driver.Prism.Device".as_ptr(),
                         kCFStringEncodingUTF8,
                     );
                     *_out_data_size = std::mem::size_of::<CFStringRef>() as UInt32;
@@ -1051,7 +1052,7 @@ unsafe extern "C" fn get_property_data(
                     let out = _out_data as *mut CFStringRef;
                     *out = CFStringCreateWithCString(
                         ptr::null(),
-                        "dev.ichigo.driver.Prism.Model\0".as_ptr() as *const i8,
+                        c"dev.ichigo.driver.Prism.Model".as_ptr(),
                         kCFStringEncodingUTF8,
                     );
                     *_out_data_size = std::mem::size_of::<CFStringRef>() as UInt32;
@@ -1060,7 +1061,7 @@ unsafe extern "C" fn get_property_data(
                     let out = _out_data as *mut CFStringRef;
                     *out = CFStringCreateWithCString(
                         ptr::null(),
-                        "Prism\0".as_ptr() as *const i8,
+                        c"Prism".as_ptr(),
                         kCFStringEncodingUTF8,
                     );
                     *_out_data_size = std::mem::size_of::<CFStringRef>() as UInt32;
@@ -1430,8 +1431,7 @@ unsafe extern "C" fn set_property_data(
 
         // pid == -1 => broadcast to all clients
         if pid == -1 {
-            for j in 0..MAX_CLIENTS {
-                let slot = &slots[j];
+            for slot in slots.iter() {
                 let prev = slot.channel_offset.swap(offset as usize, Ordering::AcqRel);
                 if prev != offset as usize {
                     zero_channel_pair(driver, prev);
@@ -1447,8 +1447,7 @@ unsafe extern "C" fn set_property_data(
 
         if pid != 0 {
             let mut found = false;
-            for j in 0..MAX_CLIENTS {
-                let slot = &slots[j];
+            for slot in slots.iter() {
                 if slot.pid.load(Ordering::Acquire) == pid {
                     let prev = slot.channel_offset.swap(offset as usize, Ordering::AcqRel);
                     if prev != offset as usize {
@@ -1882,7 +1881,7 @@ unsafe extern "C" fn do_io_operation(
 
             // Mix per-slot buffers into output for active clients
             let slots_ref = &(*driver).client_slots;
-            let input_end = input_sample_time + (frames as f64);
+            let _input_end = input_sample_time + (frames as f64);
             for slot in slots_ref.iter() {
                 let client_id = slot.client_id.load(Ordering::Acquire);
                 if client_id == 0 {
@@ -1965,7 +1964,7 @@ unsafe extern "C" fn do_io_operation(
             // Debug: Log buffer info after timing check
             static mut READ_COUNT: u32 = 0;
             READ_COUNT += 1;
-            if READ_COUNT % 100 == 0 {
+            if READ_COUNT.is_multiple_of(100) {
                 // Sample first few channels from the output buffer (after timing check)
                 let sample_ch0 = *output;
                 let sample_ch1 = *output.add(1);
@@ -1991,7 +1990,7 @@ unsafe extern "C" fn end_io_operation(
 
 // Helper for logging
 fn log_msg(msg: &str) {
-    // #[cfg(debug_assertions)]
+    #[cfg(debug_assertions)]
     {
         use std::ffi::CString;
         unsafe {

@@ -168,7 +168,7 @@ fn handle_set_app(args: Vec<String>) -> Result<(), String> {
         if ch1 < 1 {
             return Err("Channel numbers must be >= 1".to_string());
         }
-        (ch1 - 1) as u32
+        ch1 - 1
     } else {
         offset_arg.parse().map_err(|_| {
             "OFFSET must be a non-negative integer or channel range (e.g. 1-2)".to_string()
@@ -214,7 +214,7 @@ fn handle_set(args: Vec<String>) -> Result<(), String> {
         if ch1 < 1 {
             return Err("Channel numbers must be >= 1".to_string());
         }
-        (ch1 - 1) as u32
+        ch1 - 1
     } else {
         args[1].parse().map_err(|_| {
             "OFFSET must be a non-negative integer or channel range (e.g. 1-2)".to_string()
@@ -390,12 +390,15 @@ fn send_raw_payload(payload: &str) -> Result<String, String> {
 
     Ok(response)
 }
+
+#[allow(dead_code)]
 fn fetch_help_entries() -> Result<(Option<String>, Vec<HelpEntry>), String> {
     let response = send_request(&CommandRequest::Help)?;
     let parsed: RpcResponse<Vec<HelpEntry>> = parse_response(&response)?;
     extract_success(parsed)
 }
 
+#[allow(dead_code)]
 fn display_help_entries(entries: &[HelpEntry]) {
     println!("Usage: prism <command> [args]\n");
     println!("Commands:");
@@ -423,17 +426,13 @@ fn display_help_entries(entries: &[HelpEntry]) {
 
     // Reserve space for command and usage columns and margins.
     let reserved = cmd_w + usage_w + 6; // padding and separators
-    let mut desc_w = if term_width > reserved + 20 {
+    let desc_w = if term_width > reserved + 20 {
         term_width - reserved
     } else {
         40usize
     };
     // Clamp desc width to reasonable bounds
-    if desc_w < 20 {
-        desc_w = 20;
-    } else if desc_w > 100 {
-        desc_w = 100;
-    }
+    let desc_w = desc_w.clamp(20, 100);
 
     for entry in entries {
         // wrap description into lines
@@ -441,7 +440,7 @@ fn display_help_entries(entries: &[HelpEntry]) {
         let desc_lines = wrap_text(desc, desc_w);
 
         // print first line with command and usage
-        let first_desc = desc_lines.get(0).map(|s| s.as_str()).unwrap_or("");
+        let first_desc = desc_lines.first().map(|s| s.as_str()).unwrap_or("");
         println!(
             "  {usage:<usage_w$}  {desc}",
             usage = entry.usage,
@@ -464,6 +463,7 @@ fn display_help_entries(entries: &[HelpEntry]) {
 }
 
 // Simple word-wrap: split on whitespace and build lines up to `width` characters.
+#[allow(dead_code)]
 fn wrap_text(s: &str, width: usize) -> Vec<String> {
     let mut lines: Vec<String> = Vec::new();
     let mut cur = String::new();
@@ -487,6 +487,7 @@ fn wrap_text(s: &str, width: usize) -> Vec<String> {
     lines
 }
 
+#[allow(dead_code)]
 fn fallback_help_entries() -> Vec<HelpEntry> {
     vec![
         HelpEntry::new("list", "list", "Show driver properties via prismd"),
