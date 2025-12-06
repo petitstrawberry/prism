@@ -1,6 +1,13 @@
-# Prism – macOS Virtual Audio Router
+# Prism – macOS Virtual Audio Splitter
 
-Prism is a virtual routing device for macOS. It exposes a 64-channel bus where every app can be pinned to its own stereo pair, so you can feed OBS, DAWs, and recorders with isolated tracks while preserving a separate monitor mix. The driver is written in Rust and uses Accelerate (vDSP) for its realtime mixing path.
+Prism is a virtual audio splitter for macOS. It exposes a 64-channel bus where every app can be pinned to its own stereo pair, so you can feed OBS, DAWs, and recorders with isolated tracks while preserving a separate monitor mix. The driver is written in Rust and uses Accelerate (vDSP) for its realtime mixing path.
+
+## Ecosystem
+
+Prism is part of a two-app audio workflow:
+
+- **Prism** (this driver + CLI): Splits application audio → assigns each app to virtual device channels
+- **Spectrum**: Takes those channels → mixes and routes to physical output devices
 
 ## Highlights
 
